@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+data/
+*.db
+*.sqlite
+*.log
+*.zip
+*.exe
+.venv/
+venv/
