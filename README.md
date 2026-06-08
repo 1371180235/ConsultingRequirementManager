@@ -15,6 +15,10 @@
 - 需求、资金、成果物 CSV 导出
 - 本地 ZIP 备份和恢复
 
+## 版本记录
+
+详见 `CHANGELOG.md`。
+
 ## 开发运行
 
 ```powershell
