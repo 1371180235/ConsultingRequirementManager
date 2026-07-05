@@ -24,6 +24,26 @@ ROLE_DESCRIPTIONS = {
     "咨询负责人": "统筹项目规划、版本落地、资金拆分、需求响应和跨角色同步。",
     "管理员": "可查看全部模块，维护基础数据、备份恢复和操作日志。",
 }
+MONEY_COLUMNS = {
+    "total_budget",
+    "annual_budget",
+    "version_budget",
+    "estimated_budget",
+    "allocated_budget",
+    "actual_cost",
+    "amount",
+    "left_budget",
+    "right_budget",
+}
+ROLE_PANEL_TITLES = {
+    "客户": "客户视角待跟进",
+    "销售": "销售视角资金同步",
+    "项目经理": "项目经理交付关注",
+    "研发人员": "研发任务队列",
+    "运营人员": "运营问题与上线反馈",
+    "咨询负责人": "咨询负责人统筹视图",
+    "管理员": "管理员全局巡检",
+}
 STATUS_COLORS = {
     "草稿": "#eef2f7",
     "规划中": "#e8f1ff",
@@ -458,16 +478,37 @@ class App(tk.Tk):
             button = ttk.Button(side, text=name, style="Side.TButton", command=cmd)
             button.pack(fill=tk.X, padx=8, pady=2)
             self.nav_buttons[name] = button
-        self.content = ttk.Frame(main, padding=14)
-        self.content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right = ttk.Frame(main)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.content_canvas = tk.Canvas(right, bg=self.colors["bg"], highlightthickness=0)
+        self.content_scrollbar = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.content_canvas.yview)
+        self.content_canvas.configure(yscrollcommand=self.content_scrollbar.set)
+        self.content_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.content_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.content = ttk.Frame(self.content_canvas, padding=16)
+        self.content_window = self.content_canvas.create_window((0, 0), window=self.content, anchor="nw")
+        self.content.bind("<Configure>", self.on_content_configure)
+        self.content_canvas.bind("<Configure>", self.on_canvas_configure)
+        self.content_canvas.bind_all("<MouseWheel>", self.on_mousewheel)
         bottom = ttk.Frame(self, padding=(10, 5))
         bottom.pack(fill=tk.X)
         ttk.Label(bottom, text=f"数据库: {self.db.db_path}").pack(side=tk.LEFT)
         ttk.Label(bottom, text="版本: MVP 1.2").pack(side=tk.RIGHT)
 
+    def on_content_configure(self, _event=None):
+        self.content_canvas.configure(scrollregion=self.content_canvas.bbox("all"))
+
+    def on_canvas_configure(self, event):
+        self.content_canvas.itemconfigure(self.content_window, width=event.width)
+
+    def on_mousewheel(self, event):
+        if self.content_canvas.winfo_exists():
+            self.content_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
     def clear(self, title):
         for child in self.content.winfo_children():
             child.destroy()
+        self.content_canvas.yview_moveto(0)
         self.current_page = title
         self.update_nav_state()
         header = ttk.Frame(self.content)
@@ -635,25 +676,50 @@ class App(tk.Tk):
 
     def row_value(self, row, key):
         if isinstance(row, dict):
-            return row.get(key, "")
-        try:
-            return row[key]
-        except (KeyError, IndexError):
-            return ""
+            value = row.get(key, "")
+        else:
+            try:
+                value = row[key]
+            except (KeyError, IndexError):
+                return ""
+        if key in MONEY_COLUMNS and value != "":
+            return money_text(value)
+        if key == "is_frozen":
+            return "是" if str(value) in {"1", "True", "true"} else "否"
+        return value
 
-    def metric_card(self, parent, title, value, hint="", accent=None, command=None):
+    def metric_card(self, parent, title, value, hint="", accent=None, command=None, grid=None):
         card = ttk.Frame(parent, style="Card.TFrame", padding=12)
-        card.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10), pady=(0, 10))
-        ttk.Label(card, text=title, background="#ffffff").pack(anchor="w")
-        value_label = ttk.Label(card, text=str(value), style="Metric.TLabel")
+        if grid:
+            row, col = grid
+            card.grid(row=row, column=col, sticky="nsew", padx=(0, 10), pady=(0, 10))
+            parent.columnconfigure(col, weight=1, uniform="metric")
+        else:
+            card.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10), pady=(0, 10))
+        if accent:
+            tk.Frame(card, bg=accent, width=4, height=54).pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+            body = ttk.Frame(card, style="Surface.TFrame")
+            body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        else:
+            body = card
+        ttk.Label(body, text=title, background="#ffffff").pack(anchor="w")
+        value_label = ttk.Label(body, text=str(value), style="Metric.TLabel")
         if accent:
             value_label.configure(foreground=accent)
         value_label.pack(anchor="w", pady=(8, 0))
         if hint:
-            ttk.Label(card, text=hint, style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
+            ttk.Label(body, text=hint, style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
         if command:
             self.make_clickable(card, command)
         return card
+
+    def metric_grid(self, parent, cards, columns=4):
+        grid = ttk.Frame(parent)
+        grid.pack(fill=tk.X, pady=(0, 4))
+        for index, card in enumerate(cards):
+            row, col = divmod(index, columns)
+            self.metric_card(grid, *card, grid=(row, col))
+        return grid
 
     def make_clickable(self, widget, command):
         widget.configure(cursor="hand2")
@@ -665,6 +731,103 @@ class App(tk.Tk):
         self.requirement_scope.set("当前项目全部")
         self.requirement_status_filter.set(status)
         self.show_requirements()
+
+    def requirement_count(self, where, params):
+        row = self.db.one(f"SELECT COUNT(*) c FROM requirements WHERE is_deleted=0 AND {where}", tuple(params))
+        return row["c"] if row else 0
+
+    def role_dashboard_panel(self, project_id, version_id):
+        role = self.current_role.get()
+        self.section_title(self.content, ROLE_PANEL_TITLES.get(role, "角色工作台"), ROLE_DESCRIPTIONS.get(role, ""))
+        metrics = []
+        rows = []
+        columns = [
+            ("requirement_code", "需求编号", 130), ("requirement_name", "需求名称", 260),
+            ("source_role", "来源", 90), ("priority", "优先级", 70), ("status", "状态", 110),
+            ("owner_name", "对接人", 100), ("updated_at", "更新时间", 150),
+        ]
+
+        if not project_id:
+            empty = ttk.Frame(self.content)
+            empty.pack(fill=tk.X)
+            self.metric_card(empty, "暂无项目", "0", "请先创建规划项目", self.colors["warning"])
+            return
+
+        if role == "客户":
+            metrics = [
+                ("客户来源需求", self.requirement_count("project_id=? AND source_role='客户'", [project_id]), "客户直接提出的需求", self.colors["primary"]),
+                ("推进中", self.requirement_count("project_id=? AND source_role='客户' AND status NOT IN ('已上线运维','已关闭','已取消')", [project_id]), "仍需反馈进展", self.colors["warning"]),
+                ("已上线运维", self.requirement_count("project_id=? AND source_role='客户' AND status='已上线运维'", [project_id]), "可同步客户的改进结果", self.colors["success"]),
+            ]
+            rows = self.db.query("""SELECT requirement_code, requirement_name, source_role, priority, status, owner_name, updated_at
+                                    FROM requirements
+                                    WHERE is_deleted=0 AND project_id=? AND source_role='客户'
+                                    ORDER BY updated_at DESC LIMIT 8""", (project_id,))
+        elif role == "销售":
+            budget = self.db.one("""SELECT COALESCE(SUM(allocated_budget), 0) allocated, COALESCE(SUM(actual_cost), 0) cost
+                                    FROM requirements WHERE is_deleted=0 AND project_id=?""", (project_id,))
+            project = self.db.one("SELECT total_budget FROM planning_projects WHERE id=?", (project_id,))
+            metrics = [
+                ("项目总预算", money_text(project["total_budget"] if project else 0), "客户资金规划总盘", self.colors["primary"]),
+                ("已分配预算", money_text(budget["allocated"]), f"占总预算 {percent_text(budget['allocated'], project['total_budget'] if project else 0)}", self.colors["success"]),
+                ("实际消耗", money_text(budget["cost"]), f"执行率 {percent_text(budget['cost'], budget['allocated'])}", self.colors["danger"] if budget["allocated"] and budget["cost"] > budget["allocated"] else self.colors["warning"]),
+            ]
+            columns = [
+                ("version_code", "版本编号", 110), ("version_name", "版本名称", 220), ("version_budget", "版本预算", 110),
+                ("allocated_budget", "需求已分配", 110), ("actual_cost", "实际消耗", 110), ("status", "状态", 100),
+            ]
+            rows = self.db.query("""SELECT v.version_code, v.version_name, v.version_budget,
+                                           COALESCE(SUM(r.allocated_budget), 0) allocated_budget,
+                                           COALESCE(SUM(r.actual_cost), 0) actual_cost,
+                                           v.status
+                                    FROM implementation_versions v
+                                    LEFT JOIN requirements r ON r.version_id=v.id AND r.is_deleted=0
+                                    WHERE v.project_id=?
+                                    GROUP BY v.id
+                                    ORDER BY v.id DESC LIMIT 8""", (project_id,))
+        elif role == "项目经理":
+            metrics = [
+                ("当前版本需求", self.requirement_count("version_id=?", [version_id]) if version_id else 0, "当前交付范围", self.colors["primary"]),
+                ("待验收", self.requirement_count("version_id=? AND status='待验收'", [version_id]) if version_id else 0, "需要组织验收", self.colors["warning"]),
+                ("成本风险", self.requirement_count("version_id=? AND allocated_budget>0 AND actual_cost>allocated_budget", [version_id]) if version_id else 0, "实际消耗超过分配预算", self.colors["danger"]),
+            ]
+            rows = self.db.query("""SELECT requirement_code, requirement_name, source_role, priority, status, owner_name, updated_at
+                                    FROM requirements
+                                    WHERE is_deleted=0 AND version_id=?
+                                    ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 ELSE 2 END, updated_at DESC LIMIT 8""", (version_id,)) if version_id else []
+        elif role == "研发人员":
+            metrics = [
+                ("待研发任务", self.requirement_count("version_id=? AND status IN ('已排期','研发中')", [version_id]) if version_id else 0, "按优先级推进", self.colors["primary"]),
+                ("P0/P1", self.requirement_count("version_id=? AND priority IN ('P0','P1','高')", [version_id]) if version_id else 0, "高优先级任务", self.colors["warning"]),
+                ("挂起/退回", self.requirement_count("version_id=? AND status IN ('已挂起','退回修改')", [version_id]) if version_id else 0, "需要协调处理", self.colors["danger"]),
+            ]
+            rows = self.db.query("""SELECT requirement_code, requirement_name, source_role, priority, status, owner_name, updated_at
+                                    FROM requirements
+                                    WHERE is_deleted=0 AND version_id=? AND status IN ('已排期','研发中','退回修改','已挂起')
+                                    ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN '高' THEN 1 ELSE 2 END, updated_at DESC LIMIT 8""", (version_id,)) if version_id else []
+        elif role == "运营人员":
+            metrics = [
+                ("上线运维", self.requirement_count("project_id=? AND status='已上线运维'", [project_id]), "上线后持续跟踪", self.colors["success"]),
+                ("运维类需求", self.requirement_count("project_id=? AND requirement_type IN ('运维 Bug','验收整改')", [project_id]), "问题反馈池", self.colors["warning"]),
+                ("待规划反馈", self.requirement_count("project_id=? AND version_id IS NULL", [project_id]), "需回归版本规划", self.colors["primary"]),
+            ]
+            rows = self.db.query("""SELECT requirement_code, requirement_name, source_role, priority, status, owner_name, updated_at
+                                    FROM requirements
+                                    WHERE is_deleted=0 AND project_id=? AND (requirement_type IN ('运维 Bug','验收整改') OR status='已上线运维')
+                                    ORDER BY updated_at DESC LIMIT 8""", (project_id,))
+        else:
+            metrics = [
+                ("待规划池", self.requirement_count("project_id=? AND version_id IS NULL", [project_id]), "尚未确认落地版本", self.colors["warning"]),
+                ("冻结版本", self.db.one("SELECT COUNT(*) c FROM implementation_versions WHERE project_id=? AND is_frozen=1", (project_id,))["c"], "已形成基线", self.colors["primary"]),
+                ("待审批变更", self.db.one("SELECT COUNT(*) c FROM change_requests WHERE approval_status='pending'")["c"], "冻结版本变更入口", self.colors["danger"]),
+            ]
+            rows = self.db.query("""SELECT requirement_code, requirement_name, source_role, priority, status, owner_name, updated_at
+                                    FROM requirements
+                                    WHERE is_deleted=0 AND project_id=?
+                                    ORDER BY updated_at DESC LIMIT 8""", (project_id,))
+
+        self.metric_grid(self.content, metrics, columns=3)
+        self.add_table(self.content, columns, rows, height=7)
 
     def show_dashboard(self):
         self.clear("首页工作台")
@@ -697,16 +860,19 @@ class App(tk.Tk):
         role = self.current_role.get()
         msg = ROLE_DESCRIPTIONS.get(role, ROLE_DESCRIPTIONS["管理员"])
         ttk.Label(self.content, text=f"当前视角：{role}。{msg}", wraplength=920).pack(anchor="w", pady=(2, 12))
+        self.role_dashboard_panel(project_id, version_id)
         self.section_title(self.content, "需求状态分布", "按当前项目统计，辅助判断项目推进节奏。")
         status_rows = self.db.query("""SELECT status, COUNT(*) c
                                        FROM requirements
                                        WHERE is_deleted=0 AND project_id=?
                                        GROUP BY status
                                        ORDER BY MIN(id)""", (project_id,)) if project_id else []
-        status_frame = ttk.Frame(self.content)
-        status_frame.pack(fill=tk.X, pady=(0, 10))
-        for row_data in status_rows:
-            self.metric_card(status_frame, row_data["status"], row_data["c"], "点击查看该状态需求", None, lambda s=row_data["status"]: self.show_requirements_for_status(s))
+        status_cards = [
+            (row_data["status"], row_data["c"], "点击查看该状态需求", None, lambda s=row_data["status"]: self.show_requirements_for_status(s))
+            for row_data in status_rows
+        ]
+        if status_cards:
+            self.metric_grid(self.content, status_cards, columns=4)
         if not status_rows:
             ttk.Label(self.content, text="暂无需求状态数据。", style="SubTitle.TLabel").pack(anchor="w", pady=(0, 10))
         self.section_title(self.content, "最近需求", "展示当前版本最近更新的需求，切换顶部版本后联动刷新。")
@@ -1097,13 +1263,13 @@ class App(tk.Tk):
         a = self.db.one("SELECT annual_budget FROM annual_plans WHERE id=?", (self.current_plan_id(),)) if self.current_plan_id() else {"annual_budget": 0}
         v = self.db.one("SELECT version_budget FROM implementation_versions WHERE id=?", (version_id,)) if version_id else {"version_budget": 0}
         r = self.db.one("SELECT SUM(allocated_budget) allocated, SUM(actual_cost) cost FROM requirements WHERE version_id=? AND is_deleted=0", (version_id,)) if version_id else {"allocated": 0, "cost": 0}
-        row = ttk.Frame(self.content)
-        row.pack(fill=tk.X)
-        self.metric_card(row, "项目总预算", money_text(p["total_budget"] or 0), "宏观规划")
-        self.metric_card(row, "年度预算", money_text(a["annual_budget"] or 0), "年度拆分")
-        self.metric_card(row, "版本预算", money_text(v["version_budget"] or 0), "版本隔离")
-        self.metric_card(row, "需求已分配", money_text(r["allocated"] or 0), f"占版本预算 {percent_text(r['allocated'], v['version_budget'] if v else 0)}")
-        self.metric_card(row, "实际消耗", money_text(r["cost"] or 0), f"执行率 {percent_text(r['cost'], r['allocated'])}", self.colors["danger"] if (r["cost"] or 0) > (r["allocated"] or 0) and (r["allocated"] or 0) else self.colors["success"])
+        self.metric_grid(self.content, [
+            ("项目总预算", money_text(p["total_budget"] or 0), "宏观规划", self.colors["primary"]),
+            ("年度预算", money_text(a["annual_budget"] or 0), "年度拆分", self.colors["success"]),
+            ("版本预算", money_text(v["version_budget"] or 0), "版本隔离", self.colors["warning"]),
+            ("需求已分配", money_text(r["allocated"] or 0), f"占版本预算 {percent_text(r['allocated'], v['version_budget'] if v else 0)}", None),
+            ("实际消耗", money_text(r["cost"] or 0), f"执行率 {percent_text(r['cost'], r['allocated'])}", self.colors["danger"] if (r["cost"] or 0) > (r["allocated"] or 0) and (r["allocated"] or 0) else self.colors["success"]),
+        ], columns=5)
         self.section_title(self.content, "资金四级穿透", "项目总预算 -> 年度预算 -> 版本预算 -> 需求预算/实际消耗。")
         self.draw_budget_flow(project_id, self.current_plan_id(), version_id)
         self.section_title(self.content, "资金流水", "流水可关联到版本或具体需求，用于后续追溯预算调整与实际消耗。")
