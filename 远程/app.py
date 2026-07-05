@@ -1,0 +1,1697 @@
+import csv
+import json
+import os
+import re
+import shutil
+import sys
+import zipfile
+from datetime import datetime
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+
+APP_NAME = "咨询项目全流程需求管理系统"
+APP_VARIANT = "MySQL 远程版"
+MYSQL_CONFIG_FILE = "mysql_config.json"
+STATUS_FLOW = ["草稿", "规划中", "已排期", "研发中", "待验收", "已上线运维", "已关闭"]
+EXTRA_STATUSES = ["已驳回", "已挂起", "已取消", "变更中", "退回修改"]
+ROLES = ["管理员", "咨询负责人", "客户", "销售", "项目经理", "研发人员", "运营人员"]
+SENSITIVE_ROLES = {"客户", "研发人员", "运营人员"}
+ROLE_DESCRIPTIONS = {
+    "客户": "关注项目整体进度、需求处理状态、版本规划和待确认事项。",
+    "销售": "关注资金申报进度、项目进展、投入汇总和可导出材料。",
+    "项目经理": "关注版本交付进度、验收准备、实际投入和问题风险。",
+    "研发人员": "关注待办任务、需求优先级、研发状态和工期评估。",
+    "运营人员": "关注上线版本、线上问题池、运营推广记录和问题闭环。",
+    "咨询负责人": "统筹项目规划、版本落地、资金拆分、需求响应和跨角色同步。",
+    "管理员": "可查看全部模块，维护基础数据、备份恢复和操作日志。",
+}
+MONEY_COLUMNS = {
+    "total_budget",
+    "annual_budget",
+    "version_budget",
+    "estimated_budget",
+    "allocated_budget",
+    "actual_cost",
+    "amount",
+    "left_budget",
+    "right_budget",
+}
+ROLE_PANEL_TITLES = {
+    "客户": "客户视角待跟进",
+    "销售": "销售视角资金同步",
+    "项目经理": "项目经理交付关注",
+    "研发人员": "研发任务队列",
+    "运营人员": "运营问题与上线反馈",
+    "咨询负责人": "咨询负责人统筹视图",
+    "管理员": "管理员全局巡检",
+}
+STATUS_COLORS = {
+    "草稿": "#eef2f7",
+    "规划中": "#e8f1ff",
+    "已排期": "#e9f8f0",
+    "研发中": "#fff5dc",
+    "待验收": "#fff0e6",
+    "已上线运维": "#e8f7f5",
+    "已关闭": "#eceff3",
+    "已驳回": "#ffecec",
+    "已挂起": "#f2efff",
+    "已取消": "#f1f1f1",
+    "变更中": "#fdf0ff",
+    "退回修改": "#fff0f0",
+}
+ARTIFACT_STAGE_HINTS = {
+    "可研报告": "宏观规划",
+    "分年任务申报书": "规划细化",
+    "任务书方案": "建设落地",
+    "招标文件": "招投标",
+    "应标文件": "招投标",
+    "验收报告": "项目交付验收",
+    "项目总结": "项目交付验收",
+    "运维反馈": "运维运营",
+    "运营反馈": "运维运营",
+}
+
+
+def now_text():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def money_text(value):
+    return f"{float(value or 0):,.2f}"
+
+
+def percent_text(part, total):
+    total = float(total or 0)
+    if total <= 0:
+        return "0%"
+    return f"{float(part or 0) / total * 100:.1f}%"
+
+
+def app_base_dir():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+class Database:
+    def __init__(self, base_dir: Path):
+        self.base_dir = base_dir
+        self.data_dir = base_dir / "data"
+        self.config_dir = base_dir / "config"
+        self.attachments_dir = self.data_dir / "attachments"
+        self.backups_dir = self.data_dir / "backups"
+        self.exports_dir = self.data_dir / "exports"
+        for folder in [self.data_dir, self.config_dir, self.attachments_dir, self.backups_dir, self.exports_dir]:
+            folder.mkdir(parents=True, exist_ok=True)
+        self.config_path = self.config_dir / MYSQL_CONFIG_FILE
+        self.config = self.load_config()
+        self.storage_name = "MySQL"
+        self.db_label = f"mysql://{self.config['user']}@{self.config['host']}:{self.config['port']}/{self.config['database']}"
+        self.db_path = self.config_path
+        self.conn = self.connect()
+        self.init_schema()
+        self.seed_defaults()
+
+    def load_config(self):
+        example = {
+            "host": "127.0.0.1",
+            "port": 3306,
+            "user": "crm_user",
+            "password": "请修改为数据库密码",
+            "database": "consulting_requirement_manager",
+            "create_database": True,
+        }
+        if not self.config_path.exists():
+            self.config_path.write_text(json.dumps(example, ensure_ascii=False, indent=2), encoding="utf-8")
+            raise RuntimeError(
+                f"已生成 MySQL 配置文件：{self.config_path}\n"
+                "请先修改 host、port、user、password、database 后重新启动。"
+            )
+        config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        for key in ["host", "port", "user", "password", "database"]:
+            if key not in config or config[key] in ("", None):
+                raise RuntimeError(f"MySQL 配置缺少 {key}：{self.config_path}")
+        if not re.fullmatch(r"[A-Za-z0-9_]+", str(config["database"])):
+            raise RuntimeError("database 只能包含字母、数字和下划线。")
+        config["port"] = int(config["port"])
+        config["create_database"] = bool(config.get("create_database", True))
+        return config
+
+    def connect(self):
+        try:
+            import mysql.connector
+        except ImportError as exc:
+            raise RuntimeError("缺少依赖 mysql-connector-python，请先运行：pip install -r requirements.txt") from exc
+        connect_options = {
+            "host": self.config["host"],
+            "port": self.config["port"],
+            "user": self.config["user"],
+            "password": self.config["password"],
+            "charset": "utf8mb4",
+            "use_unicode": True,
+        }
+        if self.config["create_database"]:
+            server_conn = mysql.connector.connect(**connect_options)
+            server_cur = server_conn.cursor()
+            server_cur.execute(
+                f"CREATE DATABASE IF NOT EXISTS `{self.config['database']}` "
+                "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+            )
+            server_conn.commit()
+            server_cur.close()
+            server_conn.close()
+        return mysql.connector.connect(database=self.config["database"], **connect_options)
+
+    def mysql_sql(self, sql):
+        sql = sql.replace("?", "%s")
+        sql = sql.replace("v.version_code || ' ' || v.version_name", "CONCAT(v.version_code, ' ', v.version_name)")
+        return sql
+
+    def execute(self, sql, params=()):
+        cur = self.conn.cursor(dictionary=True)
+        cur.execute(self.mysql_sql(sql), params)
+        self.conn.commit()
+        return cur
+
+    def query(self, sql, params=()):
+        cur = self.conn.cursor(dictionary=True)
+        cur.execute(self.mysql_sql(sql), params)
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+
+    def one(self, sql, params=()):
+        cur = self.conn.cursor(dictionary=True)
+        cur.execute(self.mysql_sql(sql), params)
+        row = cur.fetchone()
+        cur.close()
+        return row
+
+    def init_schema(self):
+        statements = [
+            """
+            CREATE TABLE IF NOT EXISTS planning_projects (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                project_code VARCHAR(80) NOT NULL UNIQUE,
+                project_name VARCHAR(255) NOT NULL,
+                customer_name VARCHAR(255),
+                project_background TEXT,
+                total_budget DECIMAL(14,2) DEFAULT 0,
+                status VARCHAR(40) DEFAULT 'active',
+                created_at VARCHAR(32) NOT NULL,
+                updated_at VARCHAR(32) NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS annual_plans (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                project_id INT NOT NULL,
+                plan_year INT NOT NULL,
+                plan_name VARCHAR(255) NOT NULL,
+                annual_budget DECIMAL(14,2) DEFAULT 0,
+                business_pain_points TEXT,
+                plan_description TEXT,
+                status VARCHAR(40) DEFAULT 'draft',
+                created_at VARCHAR(32) NOT NULL,
+                updated_at VARCHAR(32) NOT NULL,
+                INDEX idx_annual_project(project_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS implementation_versions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                project_id INT NOT NULL,
+                annual_plan_id INT NOT NULL,
+                version_code VARCHAR(80) NOT NULL,
+                version_name VARCHAR(255) NOT NULL,
+                version_goal TEXT,
+                version_scope TEXT,
+                version_budget DECIMAL(14,2) DEFAULT 0,
+                status VARCHAR(40) DEFAULT 'planning',
+                is_frozen TINYINT DEFAULT 0,
+                planned_start_date VARCHAR(32),
+                planned_end_date VARCHAR(32),
+                actual_start_date VARCHAR(32),
+                actual_end_date VARCHAR(32),
+                created_at VARCHAR(32) NOT NULL,
+                updated_at VARCHAR(32) NOT NULL,
+                INDEX idx_version_project_plan(project_id, annual_plan_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS requirements (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                requirement_code VARCHAR(80) NOT NULL UNIQUE,
+                requirement_name VARCHAR(255) NOT NULL,
+                requirement_description TEXT NOT NULL,
+                source_role VARCHAR(40) NOT NULL,
+                proposer_name VARCHAR(120),
+                owner_name VARCHAR(120),
+                project_id INT NOT NULL,
+                annual_plan_id INT,
+                version_id INT,
+                requirement_type VARCHAR(80),
+                tags TEXT,
+                priority VARCHAR(20) DEFAULT 'P1',
+                status VARCHAR(40) DEFAULT '草稿',
+                estimated_budget DECIMAL(14,2) DEFAULT 0,
+                allocated_budget DECIMAL(14,2) DEFAULT 0,
+                actual_cost DECIMAL(14,2) DEFAULT 0,
+                planned_finish_date VARCHAR(32),
+                actual_finish_date VARCHAR(32),
+                remark TEXT,
+                is_deleted TINYINT DEFAULT 0,
+                created_at VARCHAR(32) NOT NULL,
+                updated_at VARCHAR(32) NOT NULL,
+                INDEX idx_req_project(project_id),
+                INDEX idx_req_version(version_id),
+                INDEX idx_req_status(status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS budget_flows (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                flow_code VARCHAR(80) NOT NULL UNIQUE,
+                project_id INT NOT NULL,
+                annual_plan_id INT,
+                version_id INT,
+                requirement_id INT,
+                flow_type VARCHAR(80) NOT NULL,
+                amount DECIMAL(14,2) NOT NULL,
+                description TEXT,
+                operator_name VARCHAR(120),
+                occurred_at VARCHAR(32) NOT NULL,
+                created_at VARCHAR(32) NOT NULL,
+                INDEX idx_budget_project(project_id),
+                INDEX idx_budget_version(version_id),
+                INDEX idx_budget_requirement(requirement_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                artifact_code VARCHAR(80) NOT NULL UNIQUE,
+                artifact_name VARCHAR(255) NOT NULL,
+                artifact_type VARCHAR(80) NOT NULL,
+                file_path TEXT NOT NULL,
+                file_ext VARCHAR(30),
+                file_size BIGINT,
+                related_object_type VARCHAR(40) NOT NULL,
+                related_object_id INT NOT NULL,
+                version_no VARCHAR(80),
+                description TEXT,
+                uploaded_by VARCHAR(120),
+                uploaded_at VARCHAR(32) NOT NULL,
+                created_at VARCHAR(32) NOT NULL,
+                INDEX idx_artifact_related(related_object_type, related_object_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                username VARCHAR(120) NOT NULL UNIQUE,
+                display_name VARCHAR(120) NOT NULL,
+                password_hash VARCHAR(255),
+                role_name VARCHAR(80) NOT NULL,
+                is_active TINYINT DEFAULT 1,
+                created_at VARCHAR(32) NOT NULL,
+                updated_at VARCHAR(32) NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS operation_logs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                operator_name VARCHAR(120),
+                operation_time VARCHAR(32) NOT NULL,
+                object_type VARCHAR(80) NOT NULL,
+                object_id INT,
+                operation_type VARCHAR(80) NOT NULL,
+                before_value MEDIUMTEXT,
+                after_value MEDIUMTEXT,
+                description TEXT,
+                INDEX idx_log_time(operation_time)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS change_requests (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                version_id INT NOT NULL,
+                requirement_id INT,
+                change_title VARCHAR(255) NOT NULL,
+                change_reason TEXT,
+                impact_scope TEXT,
+                approval_status VARCHAR(40) DEFAULT 'pending',
+                requested_by VARCHAR(120),
+                requested_at VARCHAR(32) NOT NULL,
+                approved_by VARCHAR(120),
+                approved_at VARCHAR(32),
+                INDEX idx_change_status(approval_status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+        ]
+        cur = self.conn.cursor()
+        for statement in statements:
+            cur.execute(statement)
+        self.conn.commit()
+        cur.close()
+
+    def seed_defaults(self):
+        if not self.one("SELECT id FROM users WHERE username='admin'"):
+            self.execute(
+                "INSERT INTO users(username, display_name, password_hash, role_name, created_at, updated_at) VALUES(?,?,?,?,?,?)",
+                ("admin", "默认管理员", "", "管理员", now_text(), now_text()),
+            )
+        if not self.one("SELECT id FROM planning_projects"):
+            t = now_text()
+            self.execute(
+                "INSERT INTO planning_projects(project_code, project_name, customer_name, project_background, total_budget, created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+                ("PRJ-DEMO", "示例咨询项目", "示例客户", "用于演示规划、年度、版本、需求、资金和成果物的完整链路。", 1000000, t, t),
+            )
+            project_id = self.one("SELECT id FROM planning_projects WHERE project_code='PRJ-DEMO'")["id"]
+            self.execute(
+                "INSERT INTO annual_plans(project_id, plan_year, plan_name, annual_budget, plan_description, created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+                (project_id, datetime.now().year, "示例年度计划", 600000, "年度任务拆分与预算安排。", t, t),
+            )
+            plan_id = self.one("SELECT id FROM annual_plans WHERE project_id=?", (project_id,))["id"]
+            self.execute(
+                "INSERT INTO implementation_versions(project_id, annual_plan_id, version_code, version_name, version_goal, version_budget, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (project_id, plan_id, "V1.0", "示例落地版本", "完成首批核心需求建设。", 300000, t, t),
+            )
+            version_id = self.one("SELECT id FROM implementation_versions WHERE project_id=?", (project_id,))["id"]
+            self.execute(
+                """INSERT INTO requirements(requirement_code, requirement_name, requirement_description, source_role, proposer_name, owner_name,
+                   project_id, annual_plan_id, version_id, requirement_type, tags, priority, status, estimated_budget, allocated_budget, actual_cost, created_at, updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ("REQ-DEMO-001", "建立统一需求池", "将客户、销售、研发、运营等来源的需求统一登记并跟踪状态。", "咨询负责人", "咨询负责人", "默认管理员",
+                 project_id, plan_id, version_id, "功能优化", "版本必做,待确认", "P0", "规划中", 80000, 60000, 12000, t, t),
+            )
+        self.log("系统", "system", None, "init", "", "", "初始化数据库和默认数据")
+
+    def log(self, operator, object_type, object_id, operation_type, before_value, after_value, description):
+        self.execute(
+            "INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id, operation_type, before_value, after_value, description) VALUES(?,?,?,?,?,?,?,?)",
+            (operator, now_text(), object_type, object_id, operation_type, str(before_value or ""), str(after_value or ""), description),
+        )
+
+
+class DetailDialog(tk.Toplevel):
+    def __init__(self, parent, title, sections):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("760x560")
+        self.minsize(640, 420)
+        body = ttk.Frame(self, padding=16, style="Surface.TFrame")
+        body.pack(fill=tk.BOTH, expand=True)
+        text = tk.Text(body, wrap=tk.WORD, relief=tk.FLAT, padx=12, pady=12, bg="#ffffff", fg="#172033")
+        ybar = ttk.Scrollbar(body, orient=tk.VERTICAL, command=text.yview)
+        text.configure(yscrollcommand=ybar.set)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ybar.pack(side=tk.RIGHT, fill=tk.Y)
+        for section_title, rows in sections:
+            text.insert(tk.END, f"{section_title}\n", "h")
+            for label, value in rows:
+                text.insert(tk.END, f"  {label}: {value or ''}\n")
+            text.insert(tk.END, "\n")
+        text.tag_configure("h", font=("Microsoft YaHei UI", 12, "bold"), foreground="#2563eb")
+        text.configure(state=tk.DISABLED)
+        ttk.Button(self, text="关闭", command=self.destroy).pack(pady=(0, 12))
+        self.transient(parent)
+        self.grab_set()
+        self.wait_visibility()
+        self.wait_window()
+
+
+class FieldDialog(tk.Toplevel):
+    def __init__(self, parent, title, fields, initial=None, required=None):
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(True, True)
+        self.result = None
+        self.vars = {}
+        self.required = set(required or [])
+        initial = initial or {}
+        body = ttk.Frame(self, padding=18, style="Surface.TFrame")
+        body.pack(fill=tk.BOTH, expand=True)
+        for row, field in enumerate(fields):
+            key, label, kind, options = field
+            label_text = f"{label} *" if key in self.required else label
+            ttk.Label(body, text=label_text, style="Surface.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=6)
+            value = initial.get(key, "")
+            if kind == "text":
+                var = tk.StringVar(value=value)
+                widget = ttk.Entry(body, textvariable=var, width=42)
+            elif kind == "combo":
+                var = tk.StringVar(value=value or (options[0] if options else ""))
+                widget = ttk.Combobox(body, textvariable=var, values=options, state="readonly", width=40)
+            elif kind == "readonly":
+                var = tk.StringVar(value=value)
+                widget = ttk.Entry(body, textvariable=var, width=42, state="readonly")
+            else:
+                var = tk.StringVar(value=value)
+                widget = tk.Text(body, width=42, height=5)
+                widget.insert("1.0", value)
+            widget.grid(row=row, column=1, sticky="ew", pady=5)
+            self.vars[key] = (var, widget, kind)
+        buttons = ttk.Frame(body)
+        buttons.grid(row=len(fields), column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="取消", command=self.destroy).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(buttons, text="保存", command=self.save).pack(side=tk.RIGHT)
+        body.columnconfigure(1, weight=1)
+        self.grab_set()
+        self.transient(parent)
+        self.wait_visibility()
+        self.focus()
+        self.update_idletasks()
+        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_width()) // 2)
+        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_height()) // 2)
+        self.geometry(f"+{x}+{y}")
+        self.wait_window()
+
+    def save(self):
+        values = {}
+        for key, (var, widget, kind) in self.vars.items():
+            values[key] = widget.get("1.0", tk.END).strip() if kind == "memo" else var.get().strip()
+        missing = [key for key in self.required if not values.get(key)]
+        if missing:
+            messagebox.showwarning("必填项缺失", "请补充标记为 * 的必填项。", parent=self)
+            return
+        self.result = values
+        self.destroy()
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.base_dir = app_base_dir()
+        self.db = Database(self.base_dir)
+        self.title(APP_NAME)
+        self.geometry("1280x760")
+        self.minsize(1100, 680)
+        self.current_user = "默认管理员"
+        self.current_role = tk.StringVar(value="管理员")
+        self.selected_project = tk.StringVar()
+        self.selected_plan = tk.StringVar()
+        self.selected_version = tk.StringVar()
+        self.search_var = tk.StringVar()
+        self.requirement_scope = tk.StringVar(value="当前版本")
+        self.requirement_status_filter = tk.StringVar(value="全部状态")
+        self.change_status_filter = tk.StringVar(value="全部")
+        self.content = None
+        self.current_page = "首页工作台"
+        self.configure_style()
+        self.build_layout()
+        self.refresh_contexts()
+        self.show_dashboard()
+
+    def configure_style(self):
+        style = ttk.Style(self)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        self.colors = {
+            "bg": "#f4f6f8",
+            "surface": "#ffffff",
+            "side": "#1f2937",
+            "side_active": "#334155",
+            "text": "#172033",
+            "muted": "#64748b",
+            "line": "#d9e1ea",
+            "primary": "#2563eb",
+            "success": "#059669",
+            "warning": "#d97706",
+            "danger": "#dc2626",
+        }
+        font = ("Microsoft YaHei UI", 10)
+        style.configure(".", font=font)
+        style.configure("TFrame", background=self.colors["bg"])
+        style.configure("Surface.TFrame", background=self.colors["surface"])
+        style.configure("Side.TFrame", background=self.colors["side"])
+        style.configure("Side.TButton", background=self.colors["side"], foreground="#ffffff", anchor="w", padding=(16, 11), borderwidth=0)
+        style.map("Side.TButton", background=[("active", self.colors["side_active"])])
+        style.configure("SideActive.TButton", background=self.colors["side_active"], foreground="#ffffff", anchor="w", padding=(16, 11), borderwidth=0)
+        style.map("SideActive.TButton", background=[("active", self.colors["side_active"])])
+        style.configure("TButton", padding=(12, 7))
+        style.configure("Primary.TButton", background=self.colors["primary"], foreground="#ffffff", padding=(12, 7))
+        style.map("Primary.TButton", background=[("active", "#1d4ed8")])
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 16, "bold"), background=self.colors["bg"], foreground=self.colors["text"])
+        style.configure("SubTitle.TLabel", font=("Microsoft YaHei UI", 10), background=self.colors["bg"], foreground=self.colors["muted"])
+        style.configure("Surface.TLabel", background=self.colors["surface"], foreground=self.colors["text"])
+        style.configure("Muted.TLabel", background=self.colors["surface"], foreground=self.colors["muted"])
+        style.configure("Metric.TLabel", font=("Microsoft YaHei UI", 20, "bold"), background=self.colors["surface"], foreground=self.colors["text"])
+        style.configure("Card.TFrame", background=self.colors["surface"], relief="solid", borderwidth=1)
+        style.configure("Treeview", rowheight=30, fieldbackground=self.colors["surface"], background=self.colors["surface"], foreground=self.colors["text"])
+        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 10, "bold"), background="#eef2f7", foreground=self.colors["text"], padding=(6, 7))
+
+    def build_layout(self):
+        top = ttk.Frame(self, padding=(14, 10), style="Surface.TFrame")
+        top.pack(fill=tk.X)
+        ttk.Label(top, text="项目", style="Surface.TLabel").pack(side=tk.LEFT)
+        self.project_box = ttk.Combobox(top, textvariable=self.selected_project, state="readonly", width=24)
+        self.project_box.pack(side=tk.LEFT, padx=(6, 12))
+        self.project_box.bind("<<ComboboxSelected>>", lambda e: self.on_project_change())
+        ttk.Label(top, text="年度", style="Surface.TLabel").pack(side=tk.LEFT)
+        self.plan_box = ttk.Combobox(top, textvariable=self.selected_plan, state="readonly", width=20)
+        self.plan_box.pack(side=tk.LEFT, padx=(6, 12))
+        self.plan_box.bind("<<ComboboxSelected>>", lambda e: self.on_plan_change())
+        ttk.Label(top, text="版本", style="Surface.TLabel").pack(side=tk.LEFT)
+        self.version_box = ttk.Combobox(top, textvariable=self.selected_version, state="readonly", width=20)
+        self.version_box.pack(side=tk.LEFT, padx=(6, 12))
+        self.version_box.bind("<<ComboboxSelected>>", lambda e: self.reload_page())
+        ttk.Entry(top, textvariable=self.search_var, width=28).pack(side=tk.LEFT, padx=(8, 4))
+        ttk.Button(top, text="搜索", command=self.show_search, style="Primary.TButton").pack(side=tk.LEFT)
+        ttk.Label(top, text="角色", style="Surface.TLabel").pack(side=tk.RIGHT, padx=(12, 4))
+        role_box = ttk.Combobox(top, textvariable=self.current_role, values=ROLES, state="readonly", width=12)
+        role_box.pack(side=tk.RIGHT)
+        role_box.bind("<<ComboboxSelected>>", lambda e: self.reload_page())
+
+        main = ttk.Frame(self)
+        main.pack(fill=tk.BOTH, expand=True)
+        side = ttk.Frame(main, style="Side.TFrame", width=180)
+        side.pack(side=tk.LEFT, fill=tk.Y)
+        side.pack_propagate(False)
+        ttk.Label(side, text=APP_NAME, background="#243142", foreground="#ffffff", font=("Microsoft YaHei UI", 11, "bold"), wraplength=150).pack(anchor="w", padx=14, pady=(16, 18))
+        self.nav_buttons = {}
+        for name, cmd in [
+            ("首页工作台", self.show_dashboard), ("项目管理", self.show_projects), ("年度计划", self.show_plans),
+            ("版本管理", self.show_versions), ("需求管理", self.show_requirements), ("资金管理", self.show_budget),
+            ("成果物管理", self.show_artifacts), ("流程里程碑", self.show_milestones), ("搜索中心", self.show_search), ("报表导出", self.show_exports),
+            ("系统设置", self.show_settings),
+        ]:
+            button = ttk.Button(side, text=name, style="Side.TButton", command=cmd)
+            button.pack(fill=tk.X, padx=8, pady=2)
+            self.nav_buttons[name] = button
+        right = ttk.Frame(main)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.content_canvas = tk.Canvas(right, bg=self.colors["bg"], highlightthickness=0)
+        self.content_scrollbar = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.content_canvas.yview)
+        self.content_canvas.configure(yscrollcommand=self.content_scrollbar.set)
+        self.content_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.content_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.content = ttk.Frame(self.content_canvas, padding=16)
+        self.content_window = self.content_canvas.create_window((0, 0), window=self.content, anchor="nw")
+        self.content.bind("<Configure>", self.on_content_configure)
+        self.content_canvas.bind("<Configure>", self.on_canvas_configure)
+        self.content_canvas.bind_all("<MouseWheel>", self.on_mousewheel)
+        bottom = ttk.Frame(self, padding=(10, 5))
+        bottom.pack(fill=tk.X)
+        ttk.Label(bottom, text=f"数据库: {self.db.db_label}").pack(side=tk.LEFT)
+        ttk.Label(bottom, text=f"版本: MVP 1.2 · {APP_VARIANT}").pack(side=tk.RIGHT)
+
+    def on_content_configure(self, _event=None):
+        self.content_canvas.configure(scrollregion=self.content_canvas.bbox("all"))
+
+    def on_canvas_configure(self, event):
+        self.content_canvas.itemconfigure(self.content_window, width=event.width)
+
+    def on_mousewheel(self, event):
+        if self.content_canvas.winfo_exists():
+            self.content_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def clear(self, title):
+        for child in self.content.winfo_children():
+            child.destroy()
+        self.content_canvas.yview_moveto(0)
+        self.current_page = title
+        self.update_nav_state()
+        header = ttk.Frame(self.content)
+        header.pack(fill=tk.X, pady=(0, 12))
+        left = ttk.Frame(header)
+        left.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(left, text=title, style="Title.TLabel").pack(anchor="w")
+        ttk.Label(left, text=self.context_summary(), style="SubTitle.TLabel").pack(anchor="w", pady=(3, 0))
+        right = ttk.Frame(header)
+        right.pack(side=tk.RIGHT)
+        ttk.Label(right, text=f"当前角色：{self.current_role.get()}", style="SubTitle.TLabel").pack(anchor="e")
+        ttk.Label(right, text=datetime.now().strftime("%Y-%m-%d %H:%M"), style="SubTitle.TLabel").pack(anchor="e", pady=(3, 0))
+
+    def update_nav_state(self):
+        for name, button in getattr(self, "nav_buttons", {}).items():
+            button.configure(style="SideActive.TButton" if name == self.current_page else "Side.TButton")
+
+    def context_summary(self):
+        project = self.selected_project.get() or "未选择项目"
+        plan = self.selected_plan.get() or "未选择年度"
+        version = self.selected_version.get() or "未选择版本"
+        version_row = self.current_version()
+        frozen = "已冻结" if version_row and version_row["is_frozen"] else "可编辑"
+        return f"项目：{project}    年度：{plan}    版本：{version}    基线状态：{frozen}"
+
+    def section_title(self, parent, title, subtitle=""):
+        box = ttk.Frame(parent)
+        box.pack(fill=tk.X, pady=(10, 8))
+        ttk.Label(box, text=title, font=("Microsoft YaHei UI", 12, "bold"), background=self.colors["bg"], foreground=self.colors["text"]).pack(anchor="w")
+        if subtitle:
+            ttk.Label(box, text=subtitle, style="SubTitle.TLabel").pack(anchor="w", pady=(2, 0))
+
+    def make_action_bar(self, parent):
+        bar = ttk.Frame(parent)
+        bar.pack(fill=tk.X, pady=(0, 10))
+        return bar
+
+    def refresh_contexts(self):
+        projects = self.db.query("SELECT id, project_name FROM planning_projects ORDER BY id")
+        self.projects = {f"{r['id']} - {r['project_name']}": r["id"] for r in projects}
+        self.project_box["values"] = list(self.projects.keys())
+        if not self.selected_project.get() and self.projects:
+            self.selected_project.set(next(iter(self.projects)))
+        self.on_project_change(refresh_only=True)
+
+    def on_project_change(self, refresh_only=False):
+        project_id = self.current_project_id()
+        plans = self.db.query("SELECT id, plan_year, plan_name FROM annual_plans WHERE project_id=? ORDER BY plan_year DESC, id", (project_id,)) if project_id else []
+        self.plans = {f"{r['id']} - {r['plan_year']} {r['plan_name']}": r["id"] for r in plans}
+        self.plan_box["values"] = list(self.plans.keys())
+        if self.plans and self.selected_plan.get() not in self.plans:
+            self.selected_plan.set(next(iter(self.plans)))
+        elif not self.plans:
+            self.selected_plan.set("")
+        self.on_plan_change(refresh_only=True)
+        if not refresh_only:
+            self.reload_page()
+
+    def on_plan_change(self, refresh_only=False):
+        project_id = self.current_project_id()
+        plan_id = self.current_plan_id()
+        versions = self.db.query("SELECT id, version_code, version_name FROM implementation_versions WHERE project_id=? AND annual_plan_id=? ORDER BY id", (project_id, plan_id)) if project_id and plan_id else []
+        self.versions = {f"{r['id']} - {r['version_code']} {r['version_name']}": r["id"] for r in versions}
+        self.version_box["values"] = list(self.versions.keys())
+        if self.versions and self.selected_version.get() not in self.versions:
+            self.selected_version.set(next(iter(self.versions)))
+        elif not self.versions:
+            self.selected_version.set("")
+        if not refresh_only:
+            self.reload_page()
+
+    def current_project_id(self):
+        return self.projects.get(self.selected_project.get())
+
+    def current_plan_id(self):
+        return self.plans.get(self.selected_plan.get())
+
+    def current_version_id(self):
+        return self.versions.get(self.selected_version.get())
+
+    def current_version(self):
+        version_id = self.current_version_id()
+        return self.db.one("SELECT * FROM implementation_versions WHERE id=?", (version_id,)) if version_id else None
+
+    def parse_float(self, value, field_name):
+        try:
+            return float(value or 0)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} 必须是数字") from exc
+
+    def parse_int(self, value, field_name):
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} 必须是整数") from exc
+
+    def requirement_options(self, include_unplanned=True):
+        version_id = self.current_version_id()
+        sql = """SELECT id, requirement_code, requirement_name
+                 FROM requirements
+                 WHERE is_deleted=0 AND project_id=? AND (?=1 OR version_id=?)
+                 ORDER BY updated_at DESC"""
+        rows = self.db.query(sql, (self.current_project_id(), 1 if include_unplanned else 0, version_id))
+        options = ["不关联具体需求"]
+        options.extend([f"{r['id']} - {r['requirement_code']} {r['requirement_name']}" for r in rows])
+        return options
+
+    def id_from_option(self, option):
+        if not option or option.startswith("不关联"):
+            return None
+        try:
+            return int(option.split(" - ", 1)[0])
+        except ValueError:
+            return None
+
+    def reload_page(self):
+        getattr(self, {
+            "首页工作台": "show_dashboard", "项目管理": "show_projects", "年度计划": "show_plans", "版本管理": "show_versions",
+            "需求管理": "show_requirements", "资金管理": "show_budget", "成果物管理": "show_artifacts", "搜索中心": "show_search",
+            "流程里程碑": "show_milestones", "报表导出": "show_exports", "系统设置": "show_settings",
+        }.get(self.current_page, "show_dashboard"))()
+
+    def add_table(self, parent, columns, rows, height=16, on_double_click=None):
+        frame = ttk.Frame(parent, style="Surface.TFrame", padding=1)
+        frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show="headings", height=height)
+        ybar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
+        xbar = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=tree.xview)
+        tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        for key, label, width in columns:
+            tree.heading(key, text=label, command=lambda col=key: self.sort_treeview(tree, col, False))
+            tree.column(key, width=width, anchor="w")
+        tree.tag_configure("odd", background="#ffffff")
+        tree.tag_configure("even", background="#f8fafc")
+        for status, color in STATUS_COLORS.items():
+            tree.tag_configure(f"status_{status}", background=color)
+        for index, row in enumerate(rows):
+            tags = ["even" if index % 2 else "odd"]
+            status = self.row_value(row, "status")
+            if status in STATUS_COLORS:
+                tags.append(f"status_{status}")
+            tree.insert("", tk.END, values=[self.row_value(row, c[0]) for c in columns], tags=tuple(tags))
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ybar.pack(side=tk.RIGHT, fill=tk.Y)
+        xbar.pack(side=tk.BOTTOM, fill=tk.X)
+        if not rows:
+            tree.insert("", tk.END, values=["暂无数据"] + [""] * (len(columns) - 1), tags=("even",))
+        if on_double_click:
+            tree.bind("<Double-Button-1>", lambda _event: on_double_click())
+        return tree
+
+    def sort_treeview(self, tree, col, reverse):
+        values = []
+        for item in tree.get_children(""):
+            cell = tree.set(item, col)
+            try:
+                sort_value = float(str(cell).replace(",", ""))
+            except ValueError:
+                sort_value = str(cell)
+            values.append((sort_value, item))
+        values.sort(reverse=reverse)
+        for index, (_, item) in enumerate(values):
+            tree.move(item, "", index)
+        tree.heading(col, command=lambda: self.sort_treeview(tree, col, not reverse))
+
+    def row_value(self, row, key):
+        if isinstance(row, dict):
+            value = row.get(key, "")
+        else:
+            try:
+                value = row[key]
+            except (KeyError, IndexError):
+                return ""
+        if key in MONEY_COLUMNS and value != "":
+            return money_text(value)
+        if key == "is_frozen":
+            return "是" if str(value) in {"1", "True", "true"} else "否"
+        return value
+
+    def metric_card(self, parent, title, value, hint="", accent=None, command=None, grid=None):
+        card = ttk.Frame(parent, style="Card.TFrame", padding=12)
+        if grid:
+            row, col = grid
+            card.grid(row=row, column=col, sticky="nsew", padx=(0, 10), pady=(0, 10))
+            parent.columnconfigure(col, weight=1, uniform="metric")
+        else:
+            card.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10), pady=(0, 10))
+        if accent:
+            tk.Frame(card, bg=accent, width=4, height=54).pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+            body = ttk.Frame(card, style="Surface.TFrame")
+            body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        else:
+            body = card
+        ttk.Label(body, text=title, background="#ffffff").pack(anchor="w")
+        value_label = ttk.Label(body, text=str(value), style="Metric.TLabel")
+        if accent:
+            value_label.configure(foreground=accent)
+        value_label.pack(anchor="w", pady=(8, 0))
+        if hint:
+            ttk.Label(body, text=hint, style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
+        if command:
+            self.make_clickable(card, command)
+        return card
+
+    def metric_grid(self, parent, cards, columns=4):
+        grid = ttk.Frame(parent)
+        grid.pack(fill=tk.X, pady=(0, 4))
+        for index, card in enumerate(cards):
+            row, col = divmod(index, columns)
+            self.metric_card(grid, *card, grid=(row, col))
+        return grid
+
+    def make_clickable(self, widget, command):
+        widget.configure(cursor="hand2")
+        widget.bind("<Button-1>", lambda _event: command())
+        for child in widget.winfo_children():
+            self.make_clickable(child, command)
+
+    def show_requirements_for_status(self, status):
+        self.requirement_scope.set("当前项目全部")
+        self.requirement_status_filter.set(status)
+        self.show_requirements()
+
+    def requirement_count(self, where, params):
+        row = self.db.one(f"SELECT COUNT(*) c FROM requirements WHERE is_deleted=0 AND {where}", tuple(params))
+        return row["c"] if row else 0
+
+    def role_dashboard_panel(self, project_id, version_id):
+        role = self.current_role.get()
+        self.section_title(self.content, ROLE_PANEL_TITLES.get(role, "角色工作台"), ROLE_DESCRIPTIONS.get(role, ""))
+        metrics = []
+        rows = []
+        columns = [
+            ("requirement_code", "需求编号", 130), ("requirement_name", "需求名称", 260),
+            ("source_role", "来源", 90), ("priority", "优先级", 70), ("status", "状态", 110),
+            ("owner_name", "对接人", 100), ("updated_at", "更新时间", 150),
+        ]
+
+        if not project_id:
+            empty = ttk.Frame(self.content)
+            empty.pack(fill=tk.X)
+            self.metric_card(empty, "暂无项目", "0", "请先创建规划项目", self.colors["warning"])
+            return
+
+        if role == "客户":
+            metrics = [
+                ("客户来源需求", self.requirement_count("project_id=? AND source_role='客户'", [project_id]), "客户直接提出的需求", self.colors["primary"]),
+                ("推进中", self.requirement_count("project_id=? AND source_role='客户' AND status NOT IN ('已上线运维','已关闭','已取消')", [project_id]), "仍需反馈进展", self.colors["warning"]),
+                ("已上线运维", self.requirement_count("project_id=? AND source_role='客户' AND status='已上线运维'", [project_id]), "可同步客户的改进结果", self.colors["success"]),
+            ]
+            rows = self.db.query("""SELECT requirement_code, requirement_name, source_role, priority, status, owner_name, updated_at
+                                    FROM requirements
+                                    WHERE is_deleted=0 AND project_id=? AND source_role='客户'
+                                    ORDER BY updated_at DESC LIMIT 8""", (project_id,))
+        elif role == "销售":
+            budget = self.db.one("""SELECT COALESCE(SUM(allocated_budget), 0) allocated, COALESCE(SUM(actual_cost), 0) cost
+                                    FROM requirements WHERE is_deleted=0 AND project_id=?""", (project_id,))
+            project = self.db.one("SELECT total_budget FROM planning_projects WHERE id=?", (project_id,))
+            metrics = [
+                ("项目总预算", money_text(project["total_budget"] if project else 0), "客户资金规划总盘", self.colors["primary"]),
+                ("已分配预算", money_text(budget["allocated"]), f"占总预算 {percent_text(budget['allocated'], project['total_budget'] if project else 0)}", self.colors["success"]),
+                ("实际消耗", money_text(budget["cost"]), f"执行率 {percent_text(budget['cost'], budget['allocated'])}", self.colors["danger"] if budget["allocated"] and budget["cost"] > budget["allocated"] else self.colors["warning"]),
+            ]
+            columns = [
+                ("version_code", "版本编号", 110), ("version_name", "版本名称", 220), ("version_budget", "版本预算", 110),
+                ("allocated_budget", "需求已分配", 110), ("actual_cost", "实际消耗", 110), ("status", "状态", 100),
+            ]
+            rows = self.db.query("""SELECT v.version_code, v.version_name, v.version_budget,
+                                           COALESCE(SUM(r.allocated_budget), 0) allocated_budget,
+                                           COALESCE(SUM(r.actual_cost), 0) actual_cost,
+                                           v.status
+                                    FROM implementation_versions v
+                                    LEFT JOIN requirements r ON r.version_id=v.id AND r.is_deleted=0
+                                    WHERE v.project_id=?
+                                    GROUP BY v.id
+                                    ORDER BY v.id DESC LIMIT 8""", (project_id,))
+        elif role == "项目经理":
+            metrics = [
+                ("当前版本需求", self.requirement_count("version_id=?", [version_id]) if version_id else 0, "当前交付范围", self.colors["primary"]),
+                ("待验收", self.requirement_count("version_id=? AND status='待验收'", [version_id]) if version_id else 0, "需要组织验收", self.colors["warning"]),
+                ("成本风险", self.requirement_count("version_id=? AND allocated_budget>0 AND actual_cost>allocated_budget", [version_id]) if version_id else 0, "实际消耗超过分配预算", self.colors["danger"]),
+            ]
+            rows = self.db.query("""SELECT requirement_code, requirement_name, source_role, priority, status, owner_name, updated_at
+                                    FROM requirements
+                                    WHERE is_deleted=0 AND version_id=?
+                                    ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 ELSE 2 END, updated_at DESC LIMIT 8""", (version_id,)) if version_id else []
+        elif role == "研发人员":
+            metrics = [
+                ("待研发任务", self.requirement_count("version_id=? AND status IN ('已排期','研发中')", [version_id]) if version_id else 0, "按优先级推进", self.colors["primary"]),
+                ("P0/P1", self.requirement_count("version_id=? AND priority IN ('P0','P1','高')", [version_id]) if version_id else 0, "高优先级任务", self.colors["warning"]),
+                ("挂起/退回", self.requirement_count("version_id=? AND status IN ('已挂起','退回修改')", [version_id]) if version_id else 0, "需要协调处理", self.colors["danger"]),
+            ]
+            rows = self.db.query("""SELECT requirement_code, requirement_name, source_role, priority, status, owner_name, updated_at
+                                    FROM requirements
+                                    WHERE is_deleted=0 AND version_id=? AND status IN ('已排期','研发中','退回修改','已挂起')
+                                    ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN '高' THEN 1 ELSE 2 END, updated_at DESC LIMIT 8""", (version_id,)) if version_id else []
+        elif role == "运营人员":
+            metrics = [
+                ("上线运维", self.requirement_count("project_id=? AND status='已上线运维'", [project_id]), "上线后持续跟踪", self.colors["success"]),
+                ("运维类需求", self.requirement_count("project_id=? AND requirement_type IN ('运维 Bug','验收整改')", [project_id]), "问题反馈池", self.colors["warning"]),
+                ("待规划反馈", self.requirement_count("project_id=? AND version_id IS NULL", [project_id]), "需回归版本规划", self.colors["primary"]),
+            ]
+            rows = self.db.query("""SELECT requirement_code, requirement_name, source_role, priority, status, owner_name, updated_at
+                                    FROM requirements
+                                    WHERE is_deleted=0 AND project_id=? AND (requirement_type IN ('运维 Bug','验收整改') OR status='已上线运维')
+                                    ORDER BY updated_at DESC LIMIT 8""", (project_id,))
+        else:
+            metrics = [
+                ("待规划池", self.requirement_count("project_id=? AND version_id IS NULL", [project_id]), "尚未确认落地版本", self.colors["warning"]),
+                ("冻结版本", self.db.one("SELECT COUNT(*) c FROM implementation_versions WHERE project_id=? AND is_frozen=1", (project_id,))["c"], "已形成基线", self.colors["primary"]),
+                ("待审批变更", self.db.one("SELECT COUNT(*) c FROM change_requests WHERE approval_status='pending'")["c"], "冻结版本变更入口", self.colors["danger"]),
+            ]
+            rows = self.db.query("""SELECT requirement_code, requirement_name, source_role, priority, status, owner_name, updated_at
+                                    FROM requirements
+                                    WHERE is_deleted=0 AND project_id=?
+                                    ORDER BY updated_at DESC LIMIT 8""", (project_id,))
+
+        self.metric_grid(self.content, metrics, columns=3)
+        self.add_table(self.content, columns, rows, height=7)
+
+    def show_dashboard(self):
+        self.clear("首页工作台")
+        project_id = self.current_project_id()
+        version_id = self.current_version_id()
+        budget = self.db.one("""SELECT
+                                    COALESCE(SUM(allocated_budget), 0) allocated,
+                                    COALESCE(SUM(actual_cost), 0) cost
+                                FROM requirements
+                                WHERE is_deleted=0 AND project_id=?""", (project_id,)) if project_id else {"allocated": 0, "cost": 0}
+        project_budget = self.db.one("SELECT total_budget FROM planning_projects WHERE id=?", (project_id,)) if project_id else {"total_budget": 0}
+        counts = {
+            "规划项目": self.db.one("SELECT COUNT(*) c FROM planning_projects")["c"],
+            "年度计划": self.db.one("SELECT COUNT(*) c FROM annual_plans WHERE project_id=?", (project_id,))["c"] if project_id else 0,
+            "落地版本": self.db.one("SELECT COUNT(*) c FROM implementation_versions WHERE project_id=?", (project_id,))["c"] if project_id else 0,
+            "版本需求": self.db.one("SELECT COUNT(*) c FROM requirements WHERE is_deleted=0 AND version_id=?", (version_id,))["c"] if version_id else 0,
+            "待规划需求": self.db.one("SELECT COUNT(*) c FROM requirements WHERE is_deleted=0 AND project_id=? AND version_id IS NULL", (project_id,))["c"] if project_id else 0,
+        }
+        row = ttk.Frame(self.content)
+        row.pack(fill=tk.X)
+        self.metric_card(row, "规划项目", counts["规划项目"], "系统项目总数")
+        self.metric_card(row, "落地版本", counts["落地版本"], "当前项目版本数")
+        self.metric_card(row, "版本需求", counts["版本需求"], "当前版本需求数")
+        self.metric_card(row, "待规划需求", counts["待规划需求"], "尚未分配版本", self.colors["warning"] if counts["待规划需求"] else self.colors["success"])
+        row2 = ttk.Frame(self.content)
+        row2.pack(fill=tk.X)
+        self.metric_card(row2, "项目总预算", money_text(project_budget["total_budget"] if project_budget else 0), "宏观规划资金")
+        self.metric_card(row2, "需求已分配", money_text(budget["allocated"]), f"占总预算 {percent_text(budget['allocated'], project_budget['total_budget'] if project_budget else 0)}")
+        self.metric_card(row2, "实际消耗", money_text(budget["cost"]), f"执行率 {percent_text(budget['cost'], budget['allocated'])}", self.colors["danger"] if budget["cost"] > budget["allocated"] and budget["allocated"] else None)
+        role = self.current_role.get()
+        msg = ROLE_DESCRIPTIONS.get(role, ROLE_DESCRIPTIONS["管理员"])
+        ttk.Label(self.content, text=f"当前视角：{role}。{msg}", wraplength=920).pack(anchor="w", pady=(2, 12))
+        self.role_dashboard_panel(project_id, version_id)
+        self.section_title(self.content, "需求状态分布", "按当前项目统计，辅助判断项目推进节奏。")
+        status_rows = self.db.query("""SELECT status, COUNT(*) c
+                                       FROM requirements
+                                       WHERE is_deleted=0 AND project_id=?
+                                       GROUP BY status
+                                       ORDER BY MIN(id)""", (project_id,)) if project_id else []
+        status_cards = [
+            (row_data["status"], row_data["c"], "点击查看该状态需求", None, lambda s=row_data["status"]: self.show_requirements_for_status(s))
+            for row_data in status_rows
+        ]
+        if status_cards:
+            self.metric_grid(self.content, status_cards, columns=4)
+        if not status_rows:
+            ttk.Label(self.content, text="暂无需求状态数据。", style="SubTitle.TLabel").pack(anchor="w", pady=(0, 10))
+        self.section_title(self.content, "最近需求", "展示当前版本最近更新的需求，切换顶部版本后联动刷新。")
+        rows = self.db.query("""SELECT requirement_code, requirement_name, source_role, priority, status, updated_at
+                                FROM requirements WHERE is_deleted=0 AND (? IS NULL OR version_id=?)
+                                ORDER BY updated_at DESC LIMIT 12""", (version_id, version_id))
+        self.add_table(self.content, [
+            ("requirement_code", "需求编号", 130), ("requirement_name", "需求名称", 260), ("source_role", "来源", 90),
+            ("priority", "优先级", 70), ("status", "状态", 110), ("updated_at", "最近更新", 150),
+        ], rows, 12)
+
+    def show_projects(self):
+        self.clear("项目管理")
+        bar = ttk.Frame(self.content)
+        bar.pack(fill=tk.X, pady=(0, 8))
+        ttk.Button(bar, text="新建项目", command=self.add_project).pack(side=tk.LEFT)
+        rows = self.db.query("SELECT id, project_code, project_name, customer_name, total_budget, status, updated_at FROM planning_projects ORDER BY id DESC")
+        self.add_table(self.content, [
+            ("id", "ID", 50), ("project_code", "项目编号", 120), ("project_name", "项目名称", 240), ("customer_name", "客户", 160),
+            ("total_budget", "总预算", 100), ("status", "状态", 90), ("updated_at", "更新时间", 150),
+        ], rows)
+
+    def add_project(self):
+        d = FieldDialog(self, "新建项目", [
+            ("project_code", "项目编号", "text", None), ("project_name", "项目名称", "text", None),
+            ("customer_name", "客户名称", "text", None), ("total_budget", "总预算", "text", None),
+            ("project_background", "项目背景", "memo", None),
+        ], required=["project_code", "project_name"])
+        if d.result:
+            try:
+                total_budget = self.parse_float(d.result["total_budget"], "总预算")
+                t = now_text()
+                self.db.execute("INSERT INTO planning_projects(project_code, project_name, customer_name, project_background, total_budget, created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+                                (d.result["project_code"], d.result["project_name"], d.result["customer_name"], d.result["project_background"], total_budget, t, t))
+                self.db.log(self.current_user, "planning_project", None, "create", "", d.result, "新建规划项目")
+                self.refresh_contexts()
+                self.show_projects()
+            except Exception as exc:
+                messagebox.showerror("保存失败", str(exc))
+
+    def show_plans(self):
+        self.clear("年度计划")
+        ttk.Button(self.content, text="新建年度计划", command=self.add_plan).pack(anchor="w", pady=(0, 8))
+        rows = self.db.query("SELECT id, plan_year, plan_name, annual_budget, status, updated_at FROM annual_plans WHERE project_id=? ORDER BY plan_year DESC, id DESC", (self.current_project_id(),))
+        self.add_table(self.content, [("id", "ID", 50), ("plan_year", "年度", 80), ("plan_name", "计划名称", 260), ("annual_budget", "年度预算", 110), ("status", "状态", 90), ("updated_at", "更新时间", 150)], rows)
+
+    def add_plan(self):
+        if not self.current_project_id():
+            messagebox.showwarning("提示", "请先新建项目")
+            return
+        d = FieldDialog(self, "新建年度计划", [
+            ("plan_year", "年度", "text", None), ("plan_name", "计划名称", "text", None), ("annual_budget", "年度预算", "text", None),
+            ("business_pain_points", "业务痛点", "memo", None), ("plan_description", "计划说明", "memo", None),
+        ], required=["plan_year", "plan_name"])
+        if d.result:
+            try:
+                plan_year = self.parse_int(d.result["plan_year"], "年度")
+                annual_budget = self.parse_float(d.result["annual_budget"], "年度预算")
+                t = now_text()
+                self.db.execute("INSERT INTO annual_plans(project_id, plan_year, plan_name, annual_budget, business_pain_points, plan_description, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                                (self.current_project_id(), plan_year, d.result["plan_name"], annual_budget, d.result["business_pain_points"], d.result["plan_description"], t, t))
+                self.db.log(self.current_user, "annual_plan", None, "create", "", d.result, "新建年度计划")
+                self.refresh_contexts()
+                self.show_plans()
+            except ValueError as exc:
+                messagebox.showerror("保存失败", str(exc))
+
+    def show_versions(self):
+        self.clear("版本管理")
+        bar = self.make_action_bar(self.content)
+        ttk.Button(bar, text="新建版本", command=self.add_version, style="Primary.TButton").pack(side=tk.LEFT)
+        ttk.Button(bar, text="冻结当前版本", command=self.freeze_version).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bar, text="跨版本比对", command=self.compare_versions).pack(side=tk.LEFT, padx=(8, 0))
+        rows = self.db.query("SELECT id, version_code, version_name, version_budget, status, is_frozen, planned_start_date, planned_end_date FROM implementation_versions WHERE project_id=? AND annual_plan_id=? ORDER BY id DESC", (self.current_project_id(), self.current_plan_id()))
+        self.add_table(self.content, [("id", "ID", 50), ("version_code", "版本编号", 100), ("version_name", "版本名称", 220), ("version_budget", "版本预算", 100), ("status", "状态", 90), ("is_frozen", "已冻结", 70), ("planned_start_date", "计划开始", 110), ("planned_end_date", "计划结束", 110)], rows)
+
+    def add_version(self):
+        if not self.current_plan_id():
+            messagebox.showwarning("提示", "请先新建年度计划")
+            return
+        d = FieldDialog(self, "新建落地版本", [
+            ("version_code", "版本编号", "text", None), ("version_name", "版本名称", "text", None), ("version_budget", "版本预算", "text", None),
+            ("planned_start_date", "计划开始日期", "text", None), ("planned_end_date", "计划结束日期", "text", None), ("version_goal", "版本目标", "memo", None), ("version_scope", "版本范围", "memo", None),
+        ], required=["version_code", "version_name"])
+        if d.result:
+            try:
+                version_budget = self.parse_float(d.result["version_budget"], "版本预算")
+                t = now_text()
+                self.db.execute("""INSERT INTO implementation_versions(project_id, annual_plan_id, version_code, version_name, version_goal, version_scope, version_budget, planned_start_date, planned_end_date, created_at, updated_at)
+                                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                                (self.current_project_id(), self.current_plan_id(), d.result["version_code"], d.result["version_name"], d.result["version_goal"], d.result["version_scope"], version_budget, d.result["planned_start_date"], d.result["planned_end_date"], t, t))
+                self.db.log(self.current_user, "implementation_version", None, "create", "", d.result, "新建落地版本")
+                self.refresh_contexts()
+                self.show_versions()
+            except ValueError as exc:
+                messagebox.showerror("保存失败", str(exc))
+
+    def freeze_version(self):
+        version_id = self.current_version_id()
+        if not version_id:
+            messagebox.showwarning("提示", "请先选择版本")
+            return
+        if not messagebox.askyesno("确认冻结", "冻结后该版本将作为基线，新增需求需走分配或变更流程。是否继续？"):
+            return
+        self.db.execute("UPDATE implementation_versions SET is_frozen=1, status='frozen', updated_at=? WHERE id=?", (now_text(), version_id))
+        self.db.log(self.current_user, "implementation_version", version_id, "freeze", "", "", "冻结版本，核心字段转入变更管理")
+        self.show_versions()
+
+    def compare_versions(self):
+        version_options = list(self.versions.keys())
+        if len(version_options) < 2:
+            messagebox.showwarning("提示", "至少需要两个版本才能比对")
+            return
+        d = FieldDialog(self, "跨版本比对", [
+            ("left", "基准版本", "combo", version_options),
+            ("right", "对比版本", "combo", version_options),
+        ], {"left": version_options[0], "right": version_options[-1]}, required=["left", "right"])
+        if not d.result:
+            return
+        left_id = self.versions.get(d.result["left"])
+        right_id = self.versions.get(d.result["right"])
+        if left_id == right_id:
+            messagebox.showwarning("提示", "请选择两个不同版本")
+            return
+        self.clear("跨版本比对")
+        left = self.db.one("SELECT version_code, version_name, version_budget FROM implementation_versions WHERE id=?", (left_id,))
+        right = self.db.one("SELECT version_code, version_name, version_budget FROM implementation_versions WHERE id=?", (right_id,))
+        row = ttk.Frame(self.content)
+        row.pack(fill=tk.X)
+        self.metric_card(row, "基准版本预算", money_text(left["version_budget"]), f"{left['version_code']} {left['version_name']}")
+        self.metric_card(row, "对比版本预算", money_text(right["version_budget"]), f"{right['version_code']} {right['version_name']}")
+        self.metric_card(row, "预算差额", money_text((right["version_budget"] or 0) - (left["version_budget"] or 0)), "对比版本 - 基准版本")
+        left_rows = {r["requirement_code"]: r for r in self.db.query("SELECT requirement_code, requirement_name, status, allocated_budget, actual_cost FROM requirements WHERE is_deleted=0 AND version_id=?", (left_id,))}
+        right_rows = {r["requirement_code"]: r for r in self.db.query("SELECT requirement_code, requirement_name, status, allocated_budget, actual_cost FROM requirements WHERE is_deleted=0 AND version_id=?", (right_id,))}
+        diff_rows = []
+        for code in sorted(set(left_rows) | set(right_rows)):
+            l = left_rows.get(code)
+            r = right_rows.get(code)
+            if not l:
+                diff_type = "新增"
+            elif not r:
+                diff_type = "移除"
+            elif (l["status"], l["allocated_budget"], l["actual_cost"], l["requirement_name"]) != (r["status"], r["allocated_budget"], r["actual_cost"], r["requirement_name"]):
+                diff_type = "变更"
+            else:
+                diff_type = "一致"
+            diff_rows.append({
+                "diff_type": diff_type,
+                "requirement_code": code,
+                "left_name": l["requirement_name"] if l else "",
+                "right_name": r["requirement_name"] if r else "",
+                "left_status": l["status"] if l else "",
+                "right_status": r["status"] if r else "",
+                "left_budget": l["allocated_budget"] if l else "",
+                "right_budget": r["allocated_budget"] if r else "",
+            })
+        self.section_title(self.content, "需求差异", "新增、移除、变更和一致需求一览。")
+        self.add_table(self.content, [("diff_type", "差异类型", 90), ("requirement_code", "需求编号", 130), ("left_name", "基准版本需求", 220), ("right_name", "对比版本需求", 220), ("left_status", "基准状态", 100), ("right_status", "对比状态", 100), ("left_budget", "基准预算", 100), ("right_budget", "对比预算", 100)], diff_rows, 14)
+
+    def show_requirements(self):
+        self.clear("需求管理")
+        bar = self.make_action_bar(self.content)
+        ttk.Button(bar, text="新建需求", command=self.add_requirement, style="Primary.TButton").pack(side=tk.LEFT)
+        ttk.Button(bar, text="查看详情", command=self.show_requirement_detail).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bar, text="编辑需求", command=self.edit_requirement).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bar, text="状态流转", command=self.advance_requirement_status).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bar, text="分配到当前版本", command=self.assign_requirement_to_current_version).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bar, text="删除需求", command=self.delete_requirement).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bar, text="导出需求清单", command=self.export_requirements).pack(side=tk.LEFT, padx=(8, 0))
+        filters = ttk.Frame(self.content)
+        filters.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(filters, text="范围").pack(side=tk.LEFT)
+        scope_box = ttk.Combobox(filters, textvariable=self.requirement_scope, values=["当前版本", "待规划池", "当前项目全部"], state="readonly", width=14)
+        scope_box.pack(side=tk.LEFT, padx=(6, 12))
+        scope_box.bind("<<ComboboxSelected>>", lambda e: self.show_requirements())
+        ttk.Label(filters, text="状态").pack(side=tk.LEFT)
+        status_box = ttk.Combobox(filters, textvariable=self.requirement_status_filter, values=["全部状态"] + STATUS_FLOW + EXTRA_STATUSES, state="readonly", width=14)
+        status_box.pack(side=tk.LEFT, padx=(6, 12))
+        status_box.bind("<<ComboboxSelected>>", lambda e: self.show_requirements())
+        role = self.current_role.get()
+        cols = [("id", "ID", 50), ("requirement_code", "需求编号", 130), ("requirement_name", "需求名称", 230), ("source_role", "来源", 90), ("requirement_type", "类型", 100), ("tags", "标签", 160), ("priority", "优先级", 70), ("status", "状态", 110)]
+        if role not in SENSITIVE_ROLES:
+            cols += [("estimated_budget", "预估预算", 100), ("allocated_budget", "分配预算", 100), ("actual_cost", "实际消耗", 100)]
+        cols += [("version_name", "所属版本", 160), ("owner_name", "对接人", 100), ("updated_at", "更新时间", 150)]
+        where = ["r.is_deleted=0", "r.project_id=?"]
+        params = [self.current_project_id()]
+        if self.requirement_scope.get() == "当前版本":
+            where.append("r.version_id=?")
+            params.append(self.current_version_id())
+        elif self.requirement_scope.get() == "待规划池":
+            where.append("r.version_id IS NULL")
+        if self.requirement_status_filter.get() != "全部状态":
+            where.append("r.status=?")
+            params.append(self.requirement_status_filter.get())
+        rows = self.db.query(f"""SELECT r.*, COALESCE(v.version_code || ' ' || v.version_name, '待规划') version_name
+                                 FROM requirements r
+                                 LEFT JOIN implementation_versions v ON r.version_id=v.id
+                                 WHERE {' AND '.join(where)}
+                                 ORDER BY r.id DESC""", tuple(params)) if self.current_project_id() else []
+        self.req_tree = self.add_table(self.content, cols, rows, on_double_click=self.show_requirement_detail)
+
+    def add_requirement(self):
+        if not self.current_project_id():
+            messagebox.showwarning("提示", "请先选择项目")
+            return
+        code = "REQ-" + datetime.now().strftime("%Y%m%d%H%M%S")
+        version_options = ["待规划池"]
+        version_options.extend(list(self.versions.keys()))
+        d = FieldDialog(self, "新建需求", [
+            ("requirement_code", "需求编号", "text", None), ("requirement_name", "需求名称", "text", None), ("source_role", "来源角色", "combo", ["客户", "销售", "项目经理", "研发", "运营", "咨询负责人"]),
+            ("proposer_name", "提出人", "text", None), ("owner_name", "对接人", "text", None), ("requirement_type", "需求类型", "combo", ["业务痛点", "功能优化", "运维 Bug", "招投标要求", "验收整改", "客户新增"]),
+            ("version_option", "所属版本", "combo", version_options),
+            ("tags", "标签", "text", None), ("priority", "优先级", "combo", ["P0", "P1", "P2", "高", "中", "低"]), ("status", "状态", "combo", STATUS_FLOW + EXTRA_STATUSES),
+            ("estimated_budget", "预估预算", "text", None), ("allocated_budget", "分配预算", "text", None), ("actual_cost", "实际消耗", "text", None),
+            ("planned_finish_date", "预计完成时间", "text", None), ("requirement_description", "需求描述", "memo", None), ("remark", "备注", "memo", None),
+        ], {"requirement_code": code, "priority": "P1", "status": "草稿", "version_option": self.selected_version.get() or "待规划池"}, required=["requirement_code", "requirement_name", "requirement_description", "source_role"])
+        if d.result:
+            try:
+                version_id = None if d.result["version_option"] == "待规划池" else self.versions.get(d.result["version_option"])
+                plan_id = self.current_plan_id() if version_id else None
+                selected_version = self.db.one("SELECT is_frozen FROM implementation_versions WHERE id=?", (version_id,)) if version_id else None
+                if selected_version and selected_version["is_frozen"]:
+                    messagebox.showwarning("版本已冻结", "目标版本已冻结，请先走变更流程。")
+                    return
+                estimated_budget = self.parse_float(d.result["estimated_budget"], "预估预算")
+                allocated_budget = self.parse_float(d.result["allocated_budget"], "分配预算")
+                actual_cost = self.parse_float(d.result["actual_cost"], "实际消耗")
+                t = now_text()
+                self.db.execute("""INSERT INTO requirements(requirement_code, requirement_name, requirement_description, source_role, proposer_name, owner_name, project_id, annual_plan_id, version_id,
+                                   requirement_type, tags, priority, status, estimated_budget, allocated_budget, actual_cost, planned_finish_date, remark, created_at, updated_at)
+                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (d.result["requirement_code"], d.result["requirement_name"], d.result["requirement_description"], d.result["source_role"], d.result["proposer_name"], d.result["owner_name"],
+                                 self.current_project_id(), plan_id, version_id, d.result["requirement_type"], d.result["tags"], d.result["priority"], d.result["status"],
+                                 estimated_budget, allocated_budget, actual_cost, d.result["planned_finish_date"], d.result["remark"], t, t))
+                self.db.log(self.current_user, "requirement", None, "create", "", d.result, "新建需求任务")
+                self.show_requirements()
+            except Exception as exc:
+                messagebox.showerror("保存失败", str(exc))
+
+    def selected_requirement_id(self):
+        sel = getattr(self, "req_tree", None).selection() if hasattr(self, "req_tree") else ()
+        if not sel:
+            messagebox.showwarning("提示", "请先在需求表中选择一行")
+            return None
+        value = self.req_tree.item(sel[0])["values"][0]
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            messagebox.showwarning("提示", "当前行不是有效需求")
+            return None
+
+    def assign_requirement_to_current_version(self):
+        req_id = self.selected_requirement_id()
+        version_id = self.current_version_id()
+        if not req_id or not version_id:
+            return
+        version = self.current_version()
+        if version and version["is_frozen"]:
+            messagebox.showwarning("版本已冻结", "当前版本已冻结，请先走变更流程。")
+            return
+        self.db.execute("UPDATE requirements SET annual_plan_id=?, version_id=?, updated_at=? WHERE id=?",
+                        (self.current_plan_id(), version_id, now_text(), req_id))
+        self.db.log(self.current_user, "requirement", req_id, "assign_version", "", version_id, "需求分配到当前版本")
+        self.requirement_scope.set("当前版本")
+        self.show_requirements()
+
+    def show_requirement_detail(self):
+        req_id = self.selected_requirement_id()
+        if not req_id:
+            return
+        self.open_requirement_detail(req_id)
+
+    def open_requirement_detail(self, req_id):
+        req = self.db.one("""SELECT r.*, p.project_name, ap.plan_name, COALESCE(v.version_code || ' ' || v.version_name, '待规划') version_name
+                             FROM requirements r
+                             LEFT JOIN planning_projects p ON r.project_id=p.id
+                             LEFT JOIN annual_plans ap ON r.annual_plan_id=ap.id
+                             LEFT JOIN implementation_versions v ON r.version_id=v.id
+                             WHERE r.id=?""", (req_id,))
+        if not req:
+            messagebox.showwarning("提示", "未找到需求详情")
+            return
+        flows = self.db.query("SELECT flow_type, amount, description, occurred_at FROM budget_flows WHERE requirement_id=? ORDER BY occurred_at DESC LIMIT 8", (req_id,))
+        artifacts = self.db.query("SELECT artifact_type, artifact_name, version_no, uploaded_at FROM artifacts WHERE related_object_type='需求' AND related_object_id=? ORDER BY uploaded_at DESC LIMIT 8", (req_id,))
+        DetailDialog(self, f"需求详情 - {req['requirement_code']}", [
+            ("基础信息", [
+                ("需求编号", req["requirement_code"]), ("需求名称", req["requirement_name"]), ("项目", req["project_name"]),
+                ("年度计划", req["plan_name"]), ("所属版本", req["version_name"]), ("来源角色", req["source_role"]),
+                ("提出人", req["proposer_name"]), ("对接人", req["owner_name"]), ("类型", req["requirement_type"]),
+                ("标签", req["tags"]), ("优先级", req["priority"]), ("状态", req["status"]),
+            ]),
+            ("资金信息", [
+                ("预估预算", money_text(req["estimated_budget"])), ("分配预算", money_text(req["allocated_budget"])),
+                ("实际消耗", money_text(req["actual_cost"])), ("预计完成", req["planned_finish_date"]),
+                ("实际完成", req["actual_finish_date"]),
+            ]),
+            ("需求描述", [("描述", req["requirement_description"]), ("备注", req["remark"])]),
+            ("最近资金流水", [(f"{f['occurred_at']} {f['flow_type']}", f"{money_text(f['amount'])} {f['description']}") for f in flows] or [("暂无", "")]),
+            ("关联成果物", [(f"{a['artifact_type']} {a['version_no'] or ''}", f"{a['artifact_name']} {a['uploaded_at']}") for a in artifacts] or [("暂无", "")]),
+        ])
+
+    def edit_requirement(self):
+        req_id = self.selected_requirement_id()
+        if not req_id:
+            return
+        req = self.db.one("SELECT * FROM requirements WHERE id=?", (req_id,))
+        version = self.db.one("SELECT is_frozen FROM implementation_versions WHERE id=?", (req["version_id"],)) if req["version_id"] else None
+        if version and version["is_frozen"]:
+            self.create_change_request(req)
+            return
+        d = FieldDialog(self, "编辑需求", [
+            ("requirement_name", "需求名称", "text", None), ("source_role", "来源角色", "combo", ["客户", "销售", "项目经理", "研发", "运营", "咨询负责人"]),
+            ("proposer_name", "提出人", "text", None), ("owner_name", "对接人", "text", None), ("requirement_type", "需求类型", "combo", ["业务痛点", "功能优化", "运维 Bug", "招投标要求", "验收整改", "客户新增"]),
+            ("tags", "标签", "text", None), ("priority", "优先级", "combo", ["P0", "P1", "P2", "高", "中", "低"]),
+            ("estimated_budget", "预估预算", "text", None), ("allocated_budget", "分配预算", "text", None), ("actual_cost", "实际消耗", "text", None),
+            ("planned_finish_date", "预计完成时间", "text", None), ("requirement_description", "需求描述", "memo", None), ("remark", "备注", "memo", None),
+        ], dict(req), required=["requirement_name", "requirement_description", "source_role"])
+        if not d.result:
+            return
+        try:
+            estimated_budget = self.parse_float(d.result["estimated_budget"], "预估预算")
+            allocated_budget = self.parse_float(d.result["allocated_budget"], "分配预算")
+            actual_cost = self.parse_float(d.result["actual_cost"], "实际消耗")
+            before = dict(req)
+            self.db.execute("""UPDATE requirements SET requirement_name=?, requirement_description=?, source_role=?, proposer_name=?, owner_name=?,
+                               requirement_type=?, tags=?, priority=?, estimated_budget=?, allocated_budget=?, actual_cost=?, planned_finish_date=?, remark=?, updated_at=?
+                               WHERE id=?""",
+                            (d.result["requirement_name"], d.result["requirement_description"], d.result["source_role"], d.result["proposer_name"], d.result["owner_name"],
+                             d.result["requirement_type"], d.result["tags"], d.result["priority"], estimated_budget, allocated_budget, actual_cost, d.result["planned_finish_date"], d.result["remark"], now_text(), req_id))
+            self.db.log(self.current_user, "requirement", req_id, "update", before, d.result, "编辑需求任务")
+            self.show_requirements()
+        except ValueError as exc:
+            messagebox.showerror("保存失败", str(exc))
+
+    def create_change_request(self, req):
+        d = FieldDialog(self, "冻结版本变更申请", [
+            ("change_title", "变更标题", "text", None),
+            ("change_reason", "变更原因", "memo", None),
+            ("impact_scope", "影响范围", "memo", None),
+        ], {"change_title": f"调整需求：{req['requirement_code']} {req['requirement_name']}"}, required=["change_title", "change_reason"])
+        if not d.result:
+            return
+        t = now_text()
+        self.db.execute("""INSERT INTO change_requests(version_id, requirement_id, change_title, change_reason, impact_scope, approval_status, requested_by, requested_at)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (req["version_id"], req["id"], d.result["change_title"], d.result["change_reason"], d.result["impact_scope"], "pending", self.current_user, t))
+        self.db.log(self.current_user, "change_request", req["id"], "create", "", d.result, "冻结版本需求变更申请")
+        messagebox.showinfo("已提交", "当前版本已冻结，变更申请已提交到系统设置中的变更申请列表。")
+
+    def delete_requirement(self):
+        req_id = self.selected_requirement_id()
+        if not req_id:
+            return
+        req = self.db.one("SELECT * FROM requirements WHERE id=?", (req_id,))
+        version = self.db.one("SELECT is_frozen FROM implementation_versions WHERE id=?", (req["version_id"],)) if req["version_id"] else None
+        if version and version["is_frozen"]:
+            messagebox.showwarning("版本已冻结", "冻结版本内需求不能直接删除，请提交变更申请。")
+            self.create_change_request(req)
+            return
+        if not messagebox.askyesno("确认删除", f"确定删除需求 {req['requirement_code']}？该操作为软删除，可在数据库日志中追溯。"):
+            return
+        self.db.execute("UPDATE requirements SET is_deleted=1, updated_at=? WHERE id=?", (now_text(), req_id))
+        self.db.log(self.current_user, "requirement", req_id, "delete", dict(req), "", "软删除需求")
+        self.show_requirements()
+
+    def advance_requirement_status(self):
+        req_id = self.selected_requirement_id()
+        if not req_id:
+            return
+        req = self.db.one("SELECT * FROM requirements WHERE id=?", (req_id,))
+        d = FieldDialog(self, "状态流转", [("status", "目标状态", "combo", STATUS_FLOW + EXTRA_STATUSES), ("remark", "流转说明", "memo", None)], {"status": req["status"]})
+        if d.result:
+            before = req["status"]
+            after = d.result["status"]
+            self.db.execute("UPDATE requirements SET status=?, remark=?, updated_at=?, actual_finish_date=CASE WHEN ?='已关闭' THEN ? ELSE actual_finish_date END WHERE id=?",
+                            (after, d.result["remark"], now_text(), after, now_text()[:10], req_id))
+            self.db.log(self.current_user, "requirement", req_id, "status_change", before, after, f"需求状态流转：{d.result['remark']}")
+            self.show_requirements()
+
+    def show_budget(self):
+        self.clear("资金管理")
+        bar = self.make_action_bar(self.content)
+        ttk.Button(bar, text="登记资金流水", command=self.add_budget_flow, style="Primary.TButton").pack(side=tk.LEFT)
+        ttk.Button(bar, text="导出资金明细", command=self.export_budget).pack(side=tk.LEFT, padx=(8, 0))
+        project_id = self.current_project_id()
+        version_id = self.current_version_id()
+        p = self.db.one("SELECT total_budget FROM planning_projects WHERE id=?", (project_id,)) if project_id else {"total_budget": 0}
+        a = self.db.one("SELECT annual_budget FROM annual_plans WHERE id=?", (self.current_plan_id(),)) if self.current_plan_id() else {"annual_budget": 0}
+        v = self.db.one("SELECT version_budget FROM implementation_versions WHERE id=?", (version_id,)) if version_id else {"version_budget": 0}
+        r = self.db.one("SELECT SUM(allocated_budget) allocated, SUM(actual_cost) cost FROM requirements WHERE version_id=? AND is_deleted=0", (version_id,)) if version_id else {"allocated": 0, "cost": 0}
+        self.metric_grid(self.content, [
+            ("项目总预算", money_text(p["total_budget"] or 0), "宏观规划", self.colors["primary"]),
+            ("年度预算", money_text(a["annual_budget"] or 0), "年度拆分", self.colors["success"]),
+            ("版本预算", money_text(v["version_budget"] or 0), "版本隔离", self.colors["warning"]),
+            ("需求已分配", money_text(r["allocated"] or 0), f"占版本预算 {percent_text(r['allocated'], v['version_budget'] if v else 0)}", None),
+            ("实际消耗", money_text(r["cost"] or 0), f"执行率 {percent_text(r['cost'], r['allocated'])}", self.colors["danger"] if (r["cost"] or 0) > (r["allocated"] or 0) and (r["allocated"] or 0) else self.colors["success"]),
+        ], columns=5)
+        self.section_title(self.content, "资金四级穿透", "项目总预算 -> 年度预算 -> 版本预算 -> 需求预算/实际消耗。")
+        self.draw_budget_flow(project_id, self.current_plan_id(), version_id)
+        self.section_title(self.content, "资金流水", "流水可关联到版本或具体需求，用于后续追溯预算调整与实际消耗。")
+        rows = self.db.query("""SELECT b.flow_code, b.flow_type, b.amount, COALESCE(r.requirement_code, '未关联') requirement_code,
+                                       b.description, b.operator_name, b.occurred_at
+                                FROM budget_flows b
+                                LEFT JOIN requirements r ON b.requirement_id=r.id
+                                WHERE b.project_id=? AND (? IS NULL OR b.version_id=? OR b.version_id IS NULL)
+                                ORDER BY b.occurred_at DESC""", (project_id, version_id, version_id)) if project_id else []
+        self.add_table(self.content, [("flow_code", "流水编号", 140), ("flow_type", "类型", 100), ("amount", "金额", 100), ("requirement_code", "关联需求", 130), ("description", "说明", 280), ("operator_name", "操作人", 100), ("occurred_at", "发生时间", 150)], rows, 10)
+
+    def draw_budget_flow(self, project_id, plan_id, version_id):
+        frame = ttk.Frame(self.content, style="Surface.TFrame", padding=12)
+        frame.pack(fill=tk.X, pady=(0, 10))
+        canvas = tk.Canvas(frame, height=260, bg="#ffffff", highlightthickness=0)
+        canvas.pack(fill=tk.X, expand=True)
+        project = self.db.one("SELECT project_name, total_budget FROM planning_projects WHERE id=?", (project_id,)) if project_id else None
+        plan = self.db.one("SELECT plan_name, annual_budget FROM annual_plans WHERE id=?", (plan_id,)) if plan_id else None
+        version = self.db.one("SELECT version_code, version_name, version_budget FROM implementation_versions WHERE id=?", (version_id,)) if version_id else None
+        requirements = self.db.query("""SELECT id, requirement_code, requirement_name, allocated_budget, actual_cost
+                                        FROM requirements
+                                        WHERE is_deleted=0 AND version_id=?
+                                        ORDER BY allocated_budget DESC, id DESC LIMIT 5""", (version_id,)) if version_id else []
+
+        def node(x, y, w, h, title, amount, color, tag=None):
+            tags = (tag,) if tag else ()
+            canvas.create_rectangle(x, y, x + w, y + h, fill=color, outline="#d9e1ea", width=1, tags=tags)
+            canvas.create_text(x + 12, y + 14, text=title, anchor="w", fill="#172033", font=("Microsoft YaHei UI", 10, "bold"), width=w - 24, tags=tags)
+            canvas.create_text(x + 12, y + 42, text=money_text(amount), anchor="w", fill="#334155", font=("Microsoft YaHei UI", 10), tags=tags)
+
+        node(20, 85, 180, 72, project["project_name"] if project else "未选择项目", project["total_budget"] if project else 0, "#e8f1ff")
+        node(250, 85, 180, 72, plan["plan_name"] if plan else "未选择年度", plan["annual_budget"] if plan else 0, "#e9f8f0")
+        version_amount = version["version_budget"] if version else 0
+        node(480, 85, 180, 72, f"{version['version_code']} {version['version_name']}" if version else "未选择版本", version_amount, "#fff5dc")
+        for x in (200, 430):
+            canvas.create_line(x, 121, x + 50, 121, arrow=tk.LAST, fill="#94a3b8", width=2)
+        if not requirements:
+            node(720, 85, 220, 72, "暂无版本需求", 0, "#eef2f7")
+            canvas.create_line(660, 121, 720, 121, arrow=tk.LAST, fill="#94a3b8", width=2)
+            return
+        y = 20
+        for req in requirements:
+            over = (req["actual_cost"] or 0) > (req["allocated_budget"] or 0) and (req["allocated_budget"] or 0) > 0
+            color = "#ffecec" if over else "#e8f7f5"
+            tag = f"req_node_{req['id']}"
+            node(720, y, 240, 42, f"{req['requirement_code']} {req['requirement_name']}", req["allocated_budget"], color, tag=tag)
+            canvas.create_text(730, y + 33, text=f"实际 {money_text(req['actual_cost'])}", anchor="w", fill="#64748b", font=("Microsoft YaHei UI", 9), tags=(tag,))
+            canvas.create_line(660, 121, 720, y + 21, arrow=tk.LAST, fill="#94a3b8", width=1)
+            canvas.tag_bind(tag, "<Enter>", lambda _event: canvas.configure(cursor="hand2"))
+            canvas.tag_bind(tag, "<Leave>", lambda _event: canvas.configure(cursor=""))
+            canvas.tag_bind(tag, "<Double-Button-1>", lambda _event, rid=req["id"]: self.open_requirement_detail(rid))
+            y += 48
+
+    def add_budget_flow(self):
+        if not self.current_project_id():
+            messagebox.showwarning("提示", "请先选择项目")
+            return
+        requirement_options = self.requirement_options(include_unplanned=False)
+        d = FieldDialog(self, "登记资金流水", [
+            ("flow_type", "资金类型", "combo", ["计划预算", "已分配预算", "实际消耗", "调整金额", "冻结金额"]),
+            ("requirement_option", "关联需求", "combo", requirement_options),
+            ("amount", "金额", "text", None), ("description", "说明", "memo", None),
+        ], required=["amount"])
+        if d.result:
+            try:
+                t = now_text()
+                code = "BF-" + datetime.now().strftime("%Y%m%d%H%M%S")
+                amount = self.parse_float(d.result["amount"], "金额")
+                requirement_id = self.id_from_option(d.result["requirement_option"])
+                self.db.execute("INSERT INTO budget_flows(flow_code, project_id, annual_plan_id, version_id, requirement_id, flow_type, amount, description, operator_name, occurred_at, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                (code, self.current_project_id(), self.current_plan_id(), self.current_version_id(), requirement_id, d.result["flow_type"], amount, d.result["description"], self.current_user, t, t))
+                self.db.log(self.current_user, "budget_flow", None, "create", "", d.result, "登记资金流水")
+                self.show_budget()
+            except ValueError as exc:
+                messagebox.showerror("保存失败", str(exc))
+
+    def show_artifacts(self):
+        self.clear("成果物管理")
+        bar = self.make_action_bar(self.content)
+        ttk.Button(bar, text="挂载本地文件", command=self.add_artifact, style="Primary.TButton").pack(side=tk.LEFT)
+        context_ids = [
+            ("项目", self.current_project_id()),
+            ("年度", self.current_plan_id()),
+            ("版本", self.current_version_id()),
+        ]
+        req_ids = [r["id"] for r in self.db.query("SELECT id FROM requirements WHERE is_deleted=0 AND version_id=?", (self.current_version_id(),))] if self.current_version_id() else []
+        where = ["(related_object_type=? AND related_object_id=?)" for obj, obj_id in context_ids if obj_id]
+        params = [item for obj, obj_id in context_ids if obj_id for item in (obj, obj_id)]
+        if req_ids:
+            where.append(f"(related_object_type='需求' AND related_object_id IN ({','.join(['?'] * len(req_ids))}))")
+            params.extend(req_ids)
+        sql = "SELECT artifact_code, artifact_name, artifact_type, related_object_type, related_object_id, version_no, file_path, uploaded_by, uploaded_at FROM artifacts"
+        if where:
+            sql += " WHERE " + " OR ".join(where)
+        sql += " ORDER BY id DESC"
+        raw_rows = self.db.query(sql, tuple(params))
+        rows = []
+        for r in raw_rows:
+            item = dict(r)
+            item["stage"] = ARTIFACT_STAGE_HINTS.get(item["artifact_type"], "其他")
+            rows.append(item)
+        self.add_table(self.content, [("artifact_code", "成果物编号", 130), ("artifact_name", "名称", 180), ("stage", "业务阶段", 110), ("artifact_type", "类型", 110), ("related_object_type", "挂载对象", 90), ("related_object_id", "对象ID", 70), ("version_no", "文件版本", 90), ("file_path", "文件路径", 320), ("uploaded_by", "上传人", 90), ("uploaded_at", "上传时间", 150)], rows)
+
+    def add_artifact(self):
+        source = filedialog.askopenfilename(title="选择成果物文件")
+        if not source:
+            return
+        d = FieldDialog(self, "成果物信息", [
+            ("artifact_type", "成果物类型", "combo", ["可研报告", "分年任务申报书", "任务书方案", "招标文件", "应标文件", "验收报告", "项目总结", "运维反馈", "运营反馈", "其他"]),
+            ("related_object_type", "挂载对象", "combo", ["项目", "年度", "版本", "需求"]),
+            ("related_object_id", "对象ID", "text", None), ("version_no", "文件版本", "text", None), ("description", "说明", "memo", None),
+        ], {"related_object_type": "版本", "related_object_id": str(self.current_version_id() or self.current_project_id() or ""), "version_no": "v1"}, required=["related_object_type", "related_object_id"])
+        if d.result:
+            src = Path(source)
+            code = "ART-" + datetime.now().strftime("%Y%m%d%H%M%S")
+            dest = self.db.attachments_dir / f"{code}{src.suffix}"
+            shutil.copy2(src, dest)
+            t = now_text()
+            try:
+                self.db.execute("""INSERT INTO artifacts(artifact_code, artifact_name, artifact_type, file_path, file_ext, file_size, related_object_type, related_object_id, version_no, description, uploaded_by, uploaded_at, created_at)
+                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (code, src.name, d.result["artifact_type"], str(dest), src.suffix, dest.stat().st_size, d.result["related_object_type"], self.parse_int(d.result["related_object_id"], "对象ID"), d.result["version_no"], d.result["description"], self.current_user, t, t))
+                self.db.log(self.current_user, "artifact", None, "create", source, dest, "挂载成果物文件")
+                self.show_artifacts()
+            except ValueError as exc:
+                messagebox.showerror("保存失败", str(exc))
+
+    def show_search(self):
+        self.clear("搜索中心")
+        keyword = self.search_var.get().strip()
+        bar = self.make_action_bar(self.content)
+        ttk.Label(bar, text="关键词").pack(side=tk.LEFT)
+        ttk.Entry(bar, textvariable=self.search_var, width=36).pack(side=tk.LEFT, padx=8)
+        ttk.Button(bar, text="查询", command=self.show_search, style="Primary.TButton").pack(side=tk.LEFT)
+        like = f"%{keyword}%"
+        rows = self.db.query("""SELECT r.requirement_code, r.requirement_name, p.project_name, ap.plan_name,
+                                       COALESCE(v.version_code || ' ' || v.version_name, '待规划') version_name,
+                                       r.source_role, r.owner_name, r.tags, r.priority, r.status,
+                                       r.allocated_budget, r.actual_cost, r.updated_at
+                                FROM requirements r
+                                LEFT JOIN planning_projects p ON r.project_id=p.id
+                                LEFT JOIN annual_plans ap ON r.annual_plan_id=ap.id
+                                LEFT JOIN implementation_versions v ON r.version_id=v.id
+                                WHERE r.is_deleted=0 AND (
+                                    r.requirement_code LIKE ? OR r.requirement_name LIKE ? OR r.requirement_description LIKE ?
+                                    OR r.tags LIKE ? OR p.project_name LIKE ? OR v.version_name LIKE ?
+                                )
+                                ORDER BY r.updated_at DESC""", (like, like, like, like, like, like)) if keyword else []
+        self.add_table(self.content, [("requirement_code", "需求编号", 130), ("requirement_name", "需求名称", 220), ("project_name", "项目", 160), ("plan_name", "年度计划", 160), ("version_name", "版本", 160), ("source_role", "来源", 90), ("owner_name", "对接人", 90), ("tags", "标签", 160), ("priority", "优先级", 70), ("status", "状态", 110), ("allocated_budget", "分配预算", 100), ("actual_cost", "实际消耗", 100), ("updated_at", "更新时间", 150)], rows)
+
+    def show_milestones(self):
+        self.clear("流程里程碑")
+        stages = [
+            ("1.宏观规划", "可研报告", "项目"),
+            ("2.规划细化", "分年任务申报书", "年度"),
+            ("3.建设落地", "任务书方案", "版本"),
+            ("4.招投标", "招标文件/应标文件", "版本"),
+            ("5.项目交付验收", "验收报告/项目总结", "版本"),
+            ("6.运维运营", "运维/运营反馈", "需求"),
+        ]
+        version_id = self.current_version_id()
+        project_id = self.current_project_id()
+        total = self.db.one("SELECT COUNT(*) c FROM requirements WHERE is_deleted=0 AND version_id=?", (version_id,))["c"] if version_id else 0
+        done = self.db.one("SELECT COUNT(*) c FROM requirements WHERE is_deleted=0 AND version_id=? AND status IN ('待验收','已上线运维','已关闭')", (version_id,))["c"] if version_id else 0
+        row = ttk.Frame(self.content)
+        row.pack(fill=tk.X)
+        self.metric_card(row, "当前版本需求", total, "版本范围内需求总数")
+        self.metric_card(row, "验收/上线/关闭", done, f"完成度 {percent_text(done, total)}", self.colors["success"] if total and done == total else self.colors["warning"])
+        self.metric_card(row, "待补成果物", self.missing_acceptance_artifact_count(), "版本完成后需关注验收报告", self.colors["danger"] if self.missing_acceptance_artifact_count() else self.colors["success"])
+        self.section_title(self.content, "阶段视图", "按照咨询项目全流程展示阶段、关键成果物和当前挂载数量。")
+        rows = []
+        for stage, artifact_names, obj_type in stages:
+            count = self.count_stage_artifacts(stage, project_id, version_id)
+            rows.append({"stage": stage, "artifact_names": artifact_names, "object_type": obj_type, "artifact_count": count, "status": "已补充" if count else "待补充"})
+        self.add_table(self.content, [("stage", "阶段", 150), ("artifact_names", "关键成果物", 240), ("object_type", "建议挂载对象", 120), ("artifact_count", "已挂载数量", 100), ("status", "状态", 100)], rows, 8)
+        if total and done == total and self.missing_acceptance_artifact_count():
+            ttk.Label(self.content, text="提醒：当前版本需求已达到验收/上线条件，请补充验收报告或项目总结。", foreground=self.colors["danger"], background=self.colors["bg"]).pack(anchor="w", pady=(8, 0))
+
+    def count_stage_artifacts(self, stage, project_id, version_id):
+        types = [k for k, v in ARTIFACT_STAGE_HINTS.items() if v == stage.split(".", 1)[-1]]
+        if not types:
+            return 0
+        placeholders = ",".join(["?"] * len(types))
+        params = types[:]
+        where = [f"artifact_type IN ({placeholders})"]
+        context = [("项目", project_id), ("年度", self.current_plan_id()), ("版本", version_id)]
+        object_filters = ["(related_object_type=? AND related_object_id=?)" for obj, obj_id in context if obj_id]
+        object_params = [item for obj, obj_id in context if obj_id for item in (obj, obj_id)]
+        if object_filters:
+            where.append("(" + " OR ".join(object_filters) + ")")
+            params.extend(object_params)
+        return self.db.one(f"SELECT COUNT(*) c FROM artifacts WHERE {' AND '.join(where)}", tuple(params))["c"]
+
+    def missing_acceptance_artifact_count(self):
+        version_id = self.current_version_id()
+        if not version_id:
+            return 0
+        count = self.db.one("""SELECT COUNT(*) c FROM artifacts
+                               WHERE related_object_type='版本' AND related_object_id=?
+                               AND artifact_type IN ('验收报告','项目总结')""", (version_id,))["c"]
+        return 0 if count else 1
+
+    def show_exports(self):
+        self.clear("报表导出")
+        ttk.Button(self.content, text="导出需求清单 CSV", command=self.export_requirements).pack(anchor="w", pady=5)
+        ttk.Button(self.content, text="导出资金明细 CSV", command=self.export_budget).pack(anchor="w", pady=5)
+        ttk.Button(self.content, text="导出成果物目录 CSV", command=self.export_artifacts).pack(anchor="w", pady=5)
+        ttk.Button(self.content, text="创建本地备份 ZIP", command=self.create_backup).pack(anchor="w", pady=5)
+        ttk.Button(self.content, text="从备份 ZIP 恢复", command=self.restore_backup).pack(anchor="w", pady=5)
+        ttk.Label(self.content, text=f"导出目录：{self.db.exports_dir}\n备份目录：{self.db.backups_dir}", wraplength=900).pack(anchor="w", pady=(12, 0))
+
+    def export_csv(self, name, rows):
+        path = self.db.exports_dir / f"{name}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+        if not rows:
+            messagebox.showinfo("提示", "没有可导出的数据")
+            return
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+            writer.writeheader()
+            writer.writerows([dict(r) for r in rows])
+        messagebox.showinfo("导出完成", str(path))
+
+    def export_requirements(self):
+        self.export_csv("requirements", self.db.query("SELECT * FROM requirements WHERE is_deleted=0 ORDER BY id DESC"))
+
+    def export_budget(self):
+        self.export_csv("budget_flows", self.db.query("SELECT * FROM budget_flows ORDER BY id DESC"))
+
+    def export_artifacts(self):
+        self.export_csv("artifacts", self.db.query("SELECT * FROM artifacts ORDER BY id DESC"))
+
+    def create_backup(self):
+        backup = self.db.backups_dir / f"backup_{datetime.now().strftime('%Y%m%d%H%M%S')}.zip"
+        with zipfile.ZipFile(backup, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("README.txt", "MySQL 远程版备份包含配置快照和附件；数据库请使用 mysqldump 做服务端备份。\n")
+            z.write(self.db.config_path, "config/mysql_config.json")
+            for file in self.db.attachments_dir.rglob("*"):
+                if file.is_file():
+                    z.write(file, f"attachments/{file.name}")
+        self.db.log(self.current_user, "backup", None, "create", "", backup, "创建本地备份")
+        messagebox.showinfo("备份完成", str(backup))
+
+    def restore_backup(self):
+        source = filedialog.askopenfilename(title="选择备份 ZIP", filetypes=[("ZIP", "*.zip")])
+        if not source:
+            return
+        if not messagebox.askyesno("确认恢复", "恢复会覆盖当前数据库和附件，请确认已另行备份。是否继续？"):
+            return
+        self.db.conn.close()
+        with zipfile.ZipFile(source, "r") as z:
+            z.extractall(self.db.data_dir)
+        messagebox.showinfo("恢复完成", "已恢复备份，请重新启动程序。")
+        self.destroy()
+
+    def show_settings(self):
+        self.clear("系统设置")
+        ttk.Label(self.content, text="本机账号：默认管理员。支持通过右上角角色选择器查看不同角色视图。", style="SubTitle.TLabel").pack(anchor="w", pady=(0, 8))
+        self.section_title(self.content, "变更申请", "冻结版本内的需求修改、删除会进入此列表，由管理员或咨询负责人审批。")
+        bar = self.make_action_bar(self.content)
+        ttk.Label(bar, text="状态").pack(side=tk.LEFT)
+        status_box = ttk.Combobox(bar, textvariable=self.change_status_filter, values=["全部", "pending", "approved", "rejected"], state="readonly", width=12)
+        status_box.pack(side=tk.LEFT, padx=(6, 10))
+        status_box.bind("<<ComboboxSelected>>", lambda e: self.show_settings())
+        ttk.Button(bar, text="通过", command=self.approve_change_request).pack(side=tk.LEFT)
+        ttk.Button(bar, text="驳回", command=self.reject_change_request).pack(side=tk.LEFT, padx=(8, 0))
+        where = ""
+        params = ()
+        if self.change_status_filter.get() != "全部":
+            where = "WHERE c.approval_status=?"
+            params = (self.change_status_filter.get(),)
+        changes = self.db.query(f"""SELECT c.id, c.approval_status, v.version_code, r.requirement_code, c.change_title,
+                                           c.requested_by, c.requested_at, c.approved_by, c.approved_at
+                                    FROM change_requests c
+                                    LEFT JOIN implementation_versions v ON c.version_id=v.id
+                                    LEFT JOIN requirements r ON c.requirement_id=r.id
+                                    {where}
+                                    ORDER BY c.id DESC LIMIT 80""", params)
+        self.change_tree = self.add_table(self.content, [("id", "ID", 50), ("approval_status", "状态", 90), ("version_code", "版本", 90), ("requirement_code", "需求编号", 130), ("change_title", "标题", 260), ("requested_by", "申请人", 90), ("requested_at", "申请时间", 150), ("approved_by", "审批人", 90), ("approved_at", "审批时间", 150)], changes, 8)
+        self.section_title(self.content, "操作日志", "记录关键数据修改、状态流转、版本冻结、成果物上传和备份等动作。")
+        rows = self.db.query("SELECT operator_name, operation_time, object_type, object_id, operation_type, description FROM operation_logs ORDER BY id DESC LIMIT 80")
+        self.add_table(self.content, [("operator_name", "操作人", 100), ("operation_time", "时间", 150), ("object_type", "对象", 120), ("object_id", "对象ID", 70), ("operation_type", "操作", 120), ("description", "说明", 360)], rows, 10)
+
+    def selected_change_id(self):
+        sel = getattr(self, "change_tree", None).selection() if hasattr(self, "change_tree") else ()
+        if not sel:
+            messagebox.showwarning("提示", "请先选择一条变更申请")
+            return None
+        value = self.change_tree.item(sel[0])["values"][0]
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            messagebox.showwarning("提示", "当前行不是有效变更申请")
+            return None
+
+    def approve_change_request(self):
+        self.update_change_request("approved")
+
+    def reject_change_request(self):
+        self.update_change_request("rejected")
+
+    def update_change_request(self, status):
+        change_id = self.selected_change_id()
+        if not change_id:
+            return
+        change = self.db.one("SELECT * FROM change_requests WHERE id=?", (change_id,))
+        if change["approval_status"] != "pending":
+            messagebox.showinfo("提示", "该变更申请已处理")
+            return
+        action = "通过" if status == "approved" else "驳回"
+        if not messagebox.askyesno("确认审批", f"确认{action}该变更申请？"):
+            return
+        t = now_text()
+        self.db.execute("UPDATE change_requests SET approval_status=?, approved_by=?, approved_at=? WHERE id=?",
+                        (status, self.current_user, t, change_id))
+        if status == "approved" and change["requirement_id"]:
+            self.db.execute("UPDATE requirements SET status='变更中', updated_at=? WHERE id=?", (t, change["requirement_id"]))
+        self.db.log(self.current_user, "change_request", change_id, status, dict(change), status, f"变更申请{action}")
+        self.show_settings()
+
+
+if __name__ == "__main__":
+    App().mainloop()
