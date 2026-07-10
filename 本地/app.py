@@ -1,8 +1,11 @@
 import csv
+import json
+import math
 import os
 import shutil
 import sqlite3
 import sys
+import tempfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -11,10 +14,34 @@ from tkinter import filedialog, messagebox, ttk
 
 
 APP_NAME = "咨询项目全流程需求管理系统"
+APP_VERSION = "1.3.0"
 STATUS_FLOW = ["草稿", "规划中", "已排期", "研发中", "待验收", "已上线运维", "已关闭"]
 EXTRA_STATUSES = ["已驳回", "已挂起", "已取消", "变更中", "退回修改"]
 ROLES = ["管理员", "咨询负责人", "客户", "销售", "项目经理", "研发人员", "运营人员"]
 SENSITIVE_ROLES = {"客户", "研发人员", "运营人员"}
+STATUS_TRANSITIONS = {
+    "草稿": ["规划中", "已取消"],
+    "规划中": ["已排期", "已驳回", "已挂起", "退回修改"],
+    "已排期": ["研发中", "已挂起", "已取消", "退回修改"],
+    "研发中": ["待验收", "已挂起", "退回修改"],
+    "待验收": ["已上线运维", "退回修改"],
+    "已上线运维": ["已关闭", "变更中"],
+    "已关闭": ["变更中"],
+    "已驳回": ["草稿", "已取消"],
+    "已挂起": ["规划中", "已排期", "研发中", "已取消"],
+    "已取消": ["草稿"],
+    "变更中": ["规划中", "已排期", "研发中", "待验收"],
+    "退回修改": ["规划中", "已排期", "研发中", "已取消"],
+}
+ROLE_ACTIONS = {
+    "管理员": {"*"},
+    "咨询负责人": {"project", "plan", "version", "requirement_create", "requirement_edit", "requirement_delete", "requirement_assign", "status", "budget", "artifact", "approve", "export"},
+    "客户": {"requirement_create"},
+    "销售": {"requirement_create", "export"},
+    "项目经理": {"requirement_create", "requirement_edit", "status", "budget", "artifact", "export"},
+    "研发人员": {"requirement_edit", "status", "artifact"},
+    "运营人员": {"requirement_create", "requirement_edit", "status", "artifact"},
+}
 ROLE_DESCRIPTIONS = {
     "客户": "关注项目整体进度、需求处理状态、版本规划和待确认事项。",
     "销售": "关注资金申报进度、项目进展、投入汇总和可导出材料。",
@@ -75,6 +102,16 @@ def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def normalize_date(value, field_name):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"{field_name}必须使用 YYYY-MM-DD 格式并且是有效日期。") from exc
+
+
 def money_text(value):
     return f"{float(value or 0):,.2f}"
 
@@ -84,6 +121,12 @@ def percent_text(part, total):
     if total <= 0:
         return "0%"
     return f"{float(part or 0) / total * 100:.1f}%"
+
+
+def csv_safe(value):
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + value
+    return value
 
 
 def app_base_dir():
@@ -111,6 +154,188 @@ class Database:
         cur = self.conn.execute(sql, params)
         self.conn.commit()
         return cur
+
+    def record_budget_flow(self, flow_code, project_id, annual_plan_id, version_id, requirement_id,
+                           flow_type, amount, description, operator_name, occurred_at, allow_actual_overrun=False):
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            req = None
+            version = self.conn.execute("SELECT version_budget, is_frozen FROM implementation_versions WHERE id=?", (version_id,)).fetchone() if version_id else None
+            if version_id and not version:
+                raise ValueError("关联版本不存在。")
+            if version and version["is_frozen"] and flow_type != "实际消耗":
+                raise ValueError("版本已冻结，只允许继续登记实际消耗；预算分配或调整需在冻结前完成。")
+            linked_types = {"已分配预算", "实际消耗", "调整金额"}
+            if flow_type in linked_types:
+                if not requirement_id:
+                    raise ValueError(f"资金类型“{flow_type}”必须关联具体需求。")
+                req = self.conn.execute("SELECT * FROM requirements WHERE id=? AND is_deleted=0", (requirement_id,)).fetchone()
+                if not req:
+                    raise ValueError("关联需求不存在或已删除。")
+                if req["version_id"] != version_id:
+                    raise ValueError("关联需求不属于当前版本。")
+            if req and flow_type in {"已分配预算", "调整金额"}:
+                new_value = float(req["allocated_budget"] or 0) + amount
+                if new_value < 0:
+                    raise ValueError("调整后的需求分配预算不能小于 0。")
+                total = self.conn.execute("SELECT COALESCE(SUM(allocated_budget),0) total FROM requirements WHERE version_id=? AND is_deleted=0", (version_id,)).fetchone()
+                projected = float(total["total"] or 0) + amount
+                if version and projected > float(version["version_budget"] or 0):
+                    raise ValueError(f"分配后版本需求预算 {money_text(projected)} 将超过版本预算 {money_text(version['version_budget'])}。")
+            if req and flow_type == "实际消耗":
+                new_actual = float(req["actual_cost"] or 0) + amount
+                if new_actual > float(req["allocated_budget"] or 0) and not allow_actual_overrun:
+                    raise ValueError("ACTUAL_OVERRUN")
+            self.conn.execute("""INSERT INTO budget_flows(flow_code, project_id, annual_plan_id, version_id,
+                                                           requirement_id, flow_type, amount, description,
+                                                           operator_name, occurred_at, created_at)
+                                 VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                              (flow_code, project_id, annual_plan_id, version_id, requirement_id, flow_type,
+                               amount, description, operator_name, occurred_at, occurred_at))
+            if req and flow_type in {"已分配预算", "调整金额"}:
+                self.conn.execute("UPDATE requirements SET allocated_budget=allocated_budget+?, updated_at=? WHERE id=?",
+                                  (amount, occurred_at, requirement_id))
+            elif req and flow_type == "实际消耗":
+                self.conn.execute("UPDATE requirements SET actual_cost=actual_cost+?, updated_at=? WHERE id=?",
+                                  (amount, occurred_at, requirement_id))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def freeze_version_with_baseline(self, version_id, operator_name, occurred_at):
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            version = self.conn.execute("SELECT * FROM implementation_versions WHERE id=?", (version_id,)).fetchone()
+            if not version:
+                raise ValueError("版本不存在。")
+            if version["is_frozen"]:
+                self.conn.rollback()
+                return None
+            summary = self.conn.execute("""SELECT COUNT(*) requirement_count,
+                                                  COALESCE(SUM(allocated_budget),0) allocated_budget,
+                                                  COALESCE(SUM(actual_cost),0) actual_cost
+                                           FROM requirements WHERE version_id=? AND is_deleted=0""", (version_id,)).fetchone()
+            last = self.conn.execute("SELECT COALESCE(MAX(snapshot_no),0) snapshot_no FROM version_baselines WHERE version_id=?", (version_id,)).fetchone()
+            snapshot_no = int(last["snapshot_no"] or 0) + 1
+            cur = self.conn.execute("""INSERT INTO version_baselines(version_id, snapshot_no, version_budget,
+                                                                     requirement_count, allocated_budget, actual_cost,
+                                                                     created_by, created_at)
+                                      VALUES(?,?,?,?,?,?,?,?)""",
+                                    (version_id, snapshot_no, version["version_budget"], summary["requirement_count"],
+                                     summary["allocated_budget"], summary["actual_cost"], operator_name, occurred_at))
+            baseline_id = cur.lastrowid
+            self.conn.execute("""INSERT INTO version_baseline_requirements(
+                                     baseline_id, requirement_id, requirement_code, requirement_name, status,
+                                     priority, allocated_budget, actual_cost, updated_at)
+                                 SELECT ?, id, requirement_code, requirement_name, status, priority,
+                                        allocated_budget, actual_cost, updated_at
+                                 FROM requirements WHERE version_id=? AND is_deleted=0""", (baseline_id, version_id))
+            cur = self.conn.execute("""UPDATE implementation_versions SET is_frozen=1, status='frozen', updated_at=?
+                                       WHERE id=? AND is_frozen=0""", (occurred_at, version_id))
+            if cur.rowcount != 1:
+                raise ValueError("版本冻结状态已被其他操作更新，请刷新后重试。")
+            self.conn.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                              operation_type, before_value, after_value, description)
+                                 VALUES(?,?,?,?,?,?,?,?)""",
+                              (operator_name, occurred_at, "implementation_version", version_id, "freeze", "",
+                               f"baseline:{baseline_id}", f"冻结版本并生成基线 #{snapshot_no}"))
+            self.conn.commit()
+            return {"baseline_id": baseline_id, "snapshot_no": snapshot_no}
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def review_change_request(self, change_id, status, operator_name, occurred_at):
+        if status not in {"approved", "rejected"}:
+            raise ValueError("无效的审批状态。")
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            change = self.conn.execute("SELECT * FROM change_requests WHERE id=?", (change_id,)).fetchone()
+            if not change:
+                raise ValueError("变更申请不存在。")
+            if change["approval_status"] != "pending":
+                raise ValueError("该变更申请已被其他操作处理，请刷新后重试。")
+            payload = self.conn.execute("SELECT * FROM change_request_payloads WHERE change_request_id=?", (change_id,)).fetchone()
+            if status == "approved" and change["requirement_id"] and payload:
+                requirement = self.conn.execute("SELECT * FROM requirements WHERE id=?", (change["requirement_id"],)).fetchone()
+                if not requirement or requirement["is_deleted"]:
+                    raise ValueError("关联需求不存在或已删除，无法应用变更。")
+                if payload["change_type"] == "delete":
+                    self.conn.execute("UPDATE requirements SET is_deleted=1, updated_at=? WHERE id=?",
+                                      (occurred_at, change["requirement_id"]))
+                elif payload["change_type"] == "update":
+                    proposed = json.loads(payload["proposed_value"] or "{}")
+                    required_values = [proposed.get("requirement_name"), proposed.get("requirement_description"), proposed.get("source_role")]
+                    if not all(str(value or "").strip() for value in required_values):
+                        raise ValueError("变更内容缺少需求名称、描述或来源角色。")
+                    estimated_budget = float(proposed.get("estimated_budget", 0) or 0)
+                    if not math.isfinite(estimated_budget) or estimated_budget < 0:
+                        raise ValueError("变更后的预估预算必须是大于等于 0 的有限数值。")
+                    planned_finish = normalize_date(proposed.get("planned_finish_date", ""), "预计完成时间")
+                    self.conn.execute("""UPDATE requirements SET requirement_name=?, requirement_description=?,
+                                           source_role=?, proposer_name=?, owner_name=?, requirement_type=?, tags=?,
+                                           priority=?, estimated_budget=?, planned_finish_date=?, remark=?,
+                                           status='变更中', updated_at=? WHERE id=?""",
+                                      (proposed.get("requirement_name", ""), proposed.get("requirement_description", ""),
+                                       proposed.get("source_role", ""), proposed.get("proposer_name", ""), proposed.get("owner_name", ""),
+                                       proposed.get("requirement_type", ""), proposed.get("tags", ""), proposed.get("priority", "P1"),
+                                       estimated_budget, planned_finish, proposed.get("remark", ""),
+                                       occurred_at, change["requirement_id"]))
+                    self.conn.execute("""INSERT INTO requirement_status_history(requirement_id, from_status, to_status,
+                                                                                  operator_name, transition_note, changed_at)
+                                         VALUES(?,?,'变更中',?,?,?)""",
+                                      (change["requirement_id"], requirement["status"], operator_name,
+                                       f"变更申请 #{change_id} 审批通过", occurred_at))
+                else:
+                    raise ValueError("变更申请内容类型无效。")
+            cur = self.conn.execute("""UPDATE change_requests SET approval_status=?, approved_by=?, approved_at=?
+                                       WHERE id=? AND approval_status='pending'""",
+                                    (status, operator_name, occurred_at, change_id))
+            if cur.rowcount != 1:
+                raise ValueError("该变更申请已被其他操作处理，请刷新后重试。")
+            self.conn.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                              operation_type, before_value, after_value, description)
+                                 VALUES(?,?,?,?,?,?,?,?)""",
+                              (operator_name, occurred_at, "change_request", change_id, status, str(dict(change)), status,
+                               "变更申请通过" if status == "approved" else "变更申请驳回"))
+            self.conn.commit()
+            return change
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def transition_requirement_status(self, requirement_id, from_status, to_status, note, operator_name, occurred_at):
+        if to_status not in STATUS_TRANSITIONS.get(from_status, []):
+            raise ValueError(f"不允许从“{from_status}”直接流转到“{to_status}”。")
+        if not str(note or "").strip():
+            raise ValueError("状态流转说明不能为空。")
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            requirement = self.conn.execute("SELECT status FROM requirements WHERE id=? AND is_deleted=0", (requirement_id,)).fetchone()
+            if not requirement or requirement["status"] != from_status:
+                self.conn.rollback()
+                return False
+            cur = self.conn.execute("""UPDATE requirements SET status=?, remark=?, updated_at=?,
+                                       actual_finish_date=CASE WHEN ?='已关闭' THEN ? WHEN ?!='已关闭' THEN NULL ELSE actual_finish_date END
+                                       WHERE id=? AND status=?""",
+                                    (to_status, note, occurred_at, to_status, occurred_at[:10], to_status, requirement_id, from_status))
+            if cur.rowcount != 1:
+                self.conn.rollback()
+                return False
+            self.conn.execute("""INSERT INTO requirement_status_history(requirement_id, from_status, to_status,
+                                                                          operator_name, transition_note, changed_at)
+                                 VALUES(?,?,?,?,?,?)""",
+                              (requirement_id, from_status, to_status, operator_name, note, occurred_at))
+            self.conn.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                              operation_type, before_value, after_value, description)
+                                 VALUES(?,?,'requirement',?,'status_change',?,?,?)""",
+                              (operator_name, occurred_at, requirement_id, from_status, to_status, f"需求状态流转：{note}"))
+            self.conn.commit()
+            return True
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def query(self, sql, params=()):
         return self.conn.execute(sql, params).fetchall()
@@ -250,6 +475,44 @@ class Database:
             approved_by TEXT,
             approved_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS requirement_status_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            requirement_id INTEGER NOT NULL,
+            from_status TEXT,
+            to_status TEXT NOT NULL,
+            operator_name TEXT,
+            transition_note TEXT,
+            changed_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS version_baselines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version_id INTEGER NOT NULL,
+            snapshot_no INTEGER NOT NULL,
+            version_budget REAL DEFAULT 0,
+            requirement_count INTEGER DEFAULT 0,
+            allocated_budget REAL DEFAULT 0,
+            actual_cost REAL DEFAULT 0,
+            created_by TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(version_id, snapshot_no)
+        );
+        CREATE TABLE IF NOT EXISTS version_baseline_requirements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            baseline_id INTEGER NOT NULL,
+            requirement_id INTEGER NOT NULL,
+            requirement_code TEXT NOT NULL,
+            requirement_name TEXT NOT NULL,
+            status TEXT,
+            priority TEXT,
+            allocated_budget REAL DEFAULT 0,
+            actual_cost REAL DEFAULT 0,
+            updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS change_request_payloads (
+            change_request_id INTEGER PRIMARY KEY,
+            change_type TEXT NOT NULL,
+            proposed_value TEXT
+        );
         """
         self.conn.executescript(schema)
         self.conn.commit()
@@ -284,6 +547,12 @@ class Database:
                 ("REQ-DEMO-001", "建立统一需求池", "将客户、销售、研发、运营等来源的需求统一登记并跟踪状态。", "咨询负责人", "咨询负责人", "默认管理员",
                  project_id, plan_id, version_id, "功能优化", "版本必做,待确认", "P0", "规划中", 80000, 60000, 12000, t, t),
             )
+        if not self.one("SELECT id FROM requirement_status_history LIMIT 1"):
+            for row in self.query("SELECT id, status, created_at FROM requirements WHERE is_deleted=0"):
+                self.execute(
+                    "INSERT INTO requirement_status_history(requirement_id, from_status, to_status, operator_name, transition_note, changed_at) VALUES(?,?,?,?,?,?)",
+                    (row["id"], "", row["status"], "系统", "初始化需求状态历史", row["created_at"]),
+                )
         self.log("系统", "system", None, "init", "", "", "初始化数据库和默认数据")
 
     def log(self, operator, object_type, object_id, operation_type, before_value, after_value, description):
@@ -329,8 +598,19 @@ class FieldDialog(tk.Toplevel):
         self.vars = {}
         self.required = set(required or [])
         initial = initial or {}
-        body = ttk.Frame(self, padding=18, style="Surface.TFrame")
-        body.pack(fill=tk.BOTH, expand=True)
+        container = ttk.Frame(self, style="Surface.TFrame")
+        container.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(container, bg="#ffffff", highlightthickness=0, width=620,
+                           height=min(620, max(300, len(fields) * 48 + 90)))
+        scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        body = ttk.Frame(canvas, padding=18, style="Surface.TFrame")
+        window = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+        self.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
         for row, field in enumerate(fields):
             key, label, kind, options = field
             label_text = f"{label} *" if key in self.required else label
@@ -361,6 +641,9 @@ class FieldDialog(tk.Toplevel):
         self.wait_visibility()
         self.focus()
         self.update_idletasks()
+        max_height = max(360, self.winfo_screenheight() - 140)
+        if self.winfo_height() > max_height:
+            self.geometry(f"{self.winfo_width()}x{max_height}")
         x = parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_width()) // 2)
         y = parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_height()) // 2)
         self.geometry(f"+{x}+{y}")
@@ -493,7 +776,7 @@ class App(tk.Tk):
         bottom = ttk.Frame(self, padding=(10, 5))
         bottom.pack(fill=tk.X)
         ttk.Label(bottom, text=f"数据库: {self.db.db_path}").pack(side=tk.LEFT)
-        ttk.Label(bottom, text="版本: MVP 1.2").pack(side=tk.RIGHT)
+        ttk.Label(bottom, text=f"版本: {APP_VERSION} · SQLite 本地版").pack(side=tk.RIGHT)
 
     def on_content_configure(self, _event=None):
         self.content_canvas.configure(scrollregion=self.content_canvas.bbox("all"))
@@ -541,10 +824,36 @@ class App(tk.Tk):
         if subtitle:
             ttk.Label(box, text=subtitle, style="SubTitle.TLabel").pack(anchor="w", pady=(2, 0))
 
+    def notice_banner(self, parent, text, tone="info"):
+        palette = {
+            "info": ("#e8f1ff", "#1d4ed8"),
+            "success": ("#e9f8f0", "#047857"),
+            "warning": ("#fff5dc", "#b45309"),
+            "danger": ("#ffecec", "#b91c1c"),
+        }
+        background, foreground = palette.get(tone, palette["info"])
+        frame = tk.Frame(parent, bg=background, highlightbackground=foreground, highlightthickness=1, padx=12, pady=9)
+        frame.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(frame, text=text, bg=background, fg=foreground, font=("Microsoft YaHei UI", 10, "bold"), anchor="w").pack(fill=tk.X)
+        return frame
+
     def make_action_bar(self, parent):
         bar = ttk.Frame(parent)
         bar.pack(fill=tk.X, pady=(0, 10))
         return bar
+
+    def can_action(self, action):
+        allowed = ROLE_ACTIONS.get(self.current_role.get(), set())
+        return "*" in allowed or action in allowed
+
+    def can_view_money(self):
+        return self.current_role.get() not in SENSITIVE_ROLES
+
+    def require_action(self, action, label):
+        if self.can_action(action):
+            return True
+        messagebox.showwarning("权限不足", f"当前角色“{self.current_role.get()}”无权执行：{label}")
+        return False
 
     def refresh_contexts(self):
         projects = self.db.query("SELECT id, project_name FROM planning_projects ORDER BY id")
@@ -595,9 +904,12 @@ class App(tk.Tk):
 
     def parse_float(self, value, field_name):
         try:
-            return float(value or 0)
+            number = float(value or 0)
+            if not math.isfinite(number):
+                raise ValueError
+            return number
         except ValueError as exc:
-            raise ValueError(f"{field_name} 必须是数字") from exc
+            raise ValueError(f"{field_name} 必须是有限数字") from exc
 
     def parse_int(self, value, field_name):
         try:
@@ -665,9 +977,10 @@ class App(tk.Tk):
         for item in tree.get_children(""):
             cell = tree.set(item, col)
             try:
-                sort_value = float(str(cell).replace(",", ""))
+                sort_value = (0, 0, float(str(cell).replace(",", "")))
             except ValueError:
-                sort_value = str(cell)
+                text_value = str(cell).strip()
+                sort_value = (1 if not text_value else 0, 1, text_value.casefold())
             values.append((sort_value, item))
         values.sort(reverse=reverse)
         for index, (_, item) in enumerate(values):
@@ -852,11 +1165,12 @@ class App(tk.Tk):
         self.metric_card(row, "落地版本", counts["落地版本"], "当前项目版本数")
         self.metric_card(row, "版本需求", counts["版本需求"], "当前版本需求数")
         self.metric_card(row, "待规划需求", counts["待规划需求"], "尚未分配版本", self.colors["warning"] if counts["待规划需求"] else self.colors["success"])
-        row2 = ttk.Frame(self.content)
-        row2.pack(fill=tk.X)
-        self.metric_card(row2, "项目总预算", money_text(project_budget["total_budget"] if project_budget else 0), "宏观规划资金")
-        self.metric_card(row2, "需求已分配", money_text(budget["allocated"]), f"占总预算 {percent_text(budget['allocated'], project_budget['total_budget'] if project_budget else 0)}")
-        self.metric_card(row2, "实际消耗", money_text(budget["cost"]), f"执行率 {percent_text(budget['cost'], budget['allocated'])}", self.colors["danger"] if budget["cost"] > budget["allocated"] and budget["allocated"] else None)
+        if self.can_view_money():
+            row2 = ttk.Frame(self.content)
+            row2.pack(fill=tk.X)
+            self.metric_card(row2, "项目总预算", money_text(project_budget["total_budget"] if project_budget else 0), "宏观规划资金")
+            self.metric_card(row2, "需求已分配", money_text(budget["allocated"]), f"占总预算 {percent_text(budget['allocated'], project_budget['total_budget'] if project_budget else 0)}")
+            self.metric_card(row2, "实际消耗", money_text(budget["cost"]), f"执行率 {percent_text(budget['cost'], budget['allocated'])}", self.colors["danger"] if budget["cost"] > budget["allocated"] and budget["allocated"] else None)
         role = self.current_role.get()
         msg = ROLE_DESCRIPTIONS.get(role, ROLE_DESCRIPTIONS["管理员"])
         ttk.Label(self.content, text=f"当前视角：{role}。{msg}", wraplength=920).pack(anchor="w", pady=(2, 12))
@@ -890,12 +1204,15 @@ class App(tk.Tk):
         bar.pack(fill=tk.X, pady=(0, 8))
         ttk.Button(bar, text="新建项目", command=self.add_project).pack(side=tk.LEFT)
         rows = self.db.query("SELECT id, project_code, project_name, customer_name, total_budget, status, updated_at FROM planning_projects ORDER BY id DESC")
-        self.add_table(self.content, [
-            ("id", "ID", 50), ("project_code", "项目编号", 120), ("project_name", "项目名称", 240), ("customer_name", "客户", 160),
-            ("total_budget", "总预算", 100), ("status", "状态", 90), ("updated_at", "更新时间", 150),
-        ], rows)
+        columns = [("id", "ID", 50), ("project_code", "项目编号", 120), ("project_name", "项目名称", 240), ("customer_name", "客户", 160)]
+        if self.can_view_money():
+            columns.append(("total_budget", "总预算", 100))
+        columns += [("status", "状态", 90), ("updated_at", "更新时间", 150)]
+        self.add_table(self.content, columns, rows)
 
     def add_project(self):
+        if not self.require_action("project", "新建项目"):
+            return
         d = FieldDialog(self, "新建项目", [
             ("project_code", "项目编号", "text", None), ("project_name", "项目名称", "text", None),
             ("customer_name", "客户名称", "text", None), ("total_budget", "总预算", "text", None),
@@ -904,6 +1221,8 @@ class App(tk.Tk):
         if d.result:
             try:
                 total_budget = self.parse_float(d.result["total_budget"], "总预算")
+                if total_budget < 0:
+                    raise ValueError("总预算不能小于 0")
                 t = now_text()
                 self.db.execute("INSERT INTO planning_projects(project_code, project_name, customer_name, project_background, total_budget, created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
                                 (d.result["project_code"], d.result["project_name"], d.result["customer_name"], d.result["project_background"], total_budget, t, t))
@@ -917,9 +1236,15 @@ class App(tk.Tk):
         self.clear("年度计划")
         ttk.Button(self.content, text="新建年度计划", command=self.add_plan).pack(anchor="w", pady=(0, 8))
         rows = self.db.query("SELECT id, plan_year, plan_name, annual_budget, status, updated_at FROM annual_plans WHERE project_id=? ORDER BY plan_year DESC, id DESC", (self.current_project_id(),))
-        self.add_table(self.content, [("id", "ID", 50), ("plan_year", "年度", 80), ("plan_name", "计划名称", 260), ("annual_budget", "年度预算", 110), ("status", "状态", 90), ("updated_at", "更新时间", 150)], rows)
+        columns = [("id", "ID", 50), ("plan_year", "年度", 80), ("plan_name", "计划名称", 260)]
+        if self.can_view_money():
+            columns.append(("annual_budget", "年度预算", 110))
+        columns += [("status", "状态", 90), ("updated_at", "更新时间", 150)]
+        self.add_table(self.content, columns, rows)
 
     def add_plan(self):
+        if not self.require_action("plan", "新建年度计划"):
+            return
         if not self.current_project_id():
             messagebox.showwarning("提示", "请先新建项目")
             return
@@ -930,7 +1255,14 @@ class App(tk.Tk):
         if d.result:
             try:
                 plan_year = self.parse_int(d.result["plan_year"], "年度")
+                if not 2000 <= plan_year <= 2100:
+                    raise ValueError("年度必须在 2000 到 2100 之间")
                 annual_budget = self.parse_float(d.result["annual_budget"], "年度预算")
+                project = self.db.one("SELECT total_budget FROM planning_projects WHERE id=?", (self.current_project_id(),))
+                if annual_budget < 0:
+                    raise ValueError("年度预算不能小于 0")
+                if project and annual_budget > float(project["total_budget"] or 0):
+                    raise ValueError("年度预算不能超过项目总预算")
                 t = now_text()
                 self.db.execute("INSERT INTO annual_plans(project_id, plan_year, plan_name, annual_budget, business_pain_points, plan_description, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
                                 (self.current_project_id(), plan_year, d.result["plan_name"], annual_budget, d.result["business_pain_points"], d.result["plan_description"], t, t))
@@ -945,11 +1277,18 @@ class App(tk.Tk):
         bar = self.make_action_bar(self.content)
         ttk.Button(bar, text="新建版本", command=self.add_version, style="Primary.TButton").pack(side=tk.LEFT)
         ttk.Button(bar, text="冻结当前版本", command=self.freeze_version).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bar, text="查看最新基线", command=self.show_version_baseline).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(bar, text="跨版本比对", command=self.compare_versions).pack(side=tk.LEFT, padx=(8, 0))
         rows = self.db.query("SELECT id, version_code, version_name, version_budget, status, is_frozen, planned_start_date, planned_end_date FROM implementation_versions WHERE project_id=? AND annual_plan_id=? ORDER BY id DESC", (self.current_project_id(), self.current_plan_id()))
-        self.add_table(self.content, [("id", "ID", 50), ("version_code", "版本编号", 100), ("version_name", "版本名称", 220), ("version_budget", "版本预算", 100), ("status", "状态", 90), ("is_frozen", "已冻结", 70), ("planned_start_date", "计划开始", 110), ("planned_end_date", "计划结束", 110)], rows)
+        columns = [("id", "ID", 50), ("version_code", "版本编号", 100), ("version_name", "版本名称", 220)]
+        if self.can_view_money():
+            columns.append(("version_budget", "版本预算", 100))
+        columns += [("status", "状态", 90), ("is_frozen", "已冻结", 70), ("planned_start_date", "计划开始", 110), ("planned_end_date", "计划结束", 110)]
+        self.add_table(self.content, columns, rows)
 
     def add_version(self):
+        if not self.require_action("version", "新建版本"):
+            return
         if not self.current_plan_id():
             messagebox.showwarning("提示", "请先新建年度计划")
             return
@@ -960,10 +1299,19 @@ class App(tk.Tk):
         if d.result:
             try:
                 version_budget = self.parse_float(d.result["version_budget"], "版本预算")
+                planned_start = normalize_date(d.result["planned_start_date"], "计划开始日期")
+                planned_end = normalize_date(d.result["planned_end_date"], "计划结束日期")
+                if planned_start and planned_end and planned_end < planned_start:
+                    raise ValueError("计划结束日期不能早于计划开始日期")
+                plan = self.db.one("SELECT annual_budget FROM annual_plans WHERE id=?", (self.current_plan_id(),))
+                if version_budget < 0:
+                    raise ValueError("版本预算不能小于 0")
+                if plan and version_budget > float(plan["annual_budget"] or 0):
+                    raise ValueError("版本预算不能超过年度预算")
                 t = now_text()
                 self.db.execute("""INSERT INTO implementation_versions(project_id, annual_plan_id, version_code, version_name, version_goal, version_scope, version_budget, planned_start_date, planned_end_date, created_at, updated_at)
                                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                                (self.current_project_id(), self.current_plan_id(), d.result["version_code"], d.result["version_name"], d.result["version_goal"], d.result["version_scope"], version_budget, d.result["planned_start_date"], d.result["planned_end_date"], t, t))
+                                (self.current_project_id(), self.current_plan_id(), d.result["version_code"], d.result["version_name"], d.result["version_goal"], d.result["version_scope"], version_budget, planned_start, planned_end, t, t))
                 self.db.log(self.current_user, "implementation_version", None, "create", "", d.result, "新建落地版本")
                 self.refresh_contexts()
                 self.show_versions()
@@ -971,15 +1319,43 @@ class App(tk.Tk):
                 messagebox.showerror("保存失败", str(exc))
 
     def freeze_version(self):
+        if not self.require_action("version", "冻结版本"):
+            return
         version_id = self.current_version_id()
         if not version_id:
             messagebox.showwarning("提示", "请先选择版本")
             return
+        version = self.db.one("SELECT * FROM implementation_versions WHERE id=?", (version_id,))
+        if version["is_frozen"]:
+            messagebox.showinfo("提示", "当前版本已经冻结，并已生成基线。")
+            return
         if not messagebox.askyesno("确认冻结", "冻结后该版本将作为基线，新增需求需走分配或变更流程。是否继续？"):
             return
-        self.db.execute("UPDATE implementation_versions SET is_frozen=1, status='frozen', updated_at=? WHERE id=?", (now_text(), version_id))
-        self.db.log(self.current_user, "implementation_version", version_id, "freeze", "", "", "冻结版本，核心字段转入变更管理")
-        self.show_versions()
+        try:
+            result = self.db.freeze_version_with_baseline(version_id, self.current_user, now_text())
+            if result is None:
+                messagebox.showinfo("提示", "当前版本已经由其他操作冻结，请刷新查看。")
+            else:
+                messagebox.showinfo("冻结完成", f"版本已冻结并生成基线 #{result['snapshot_no']}。")
+            self.show_versions()
+        except Exception as exc:
+            messagebox.showerror("冻结失败", str(exc))
+
+    def show_version_baseline(self):
+        version_id = self.current_version_id()
+        baseline = self.db.one("SELECT * FROM version_baselines WHERE version_id=? ORDER BY snapshot_no DESC LIMIT 1", (version_id,)) if version_id else None
+        if not baseline:
+            messagebox.showinfo("版本基线", "当前版本尚未生成基线，请先冻结版本。")
+            return
+        rows = self.db.query("SELECT requirement_code, requirement_name, status, priority, allocated_budget, actual_cost FROM version_baseline_requirements WHERE baseline_id=? ORDER BY id", (baseline["id"],))
+        self.clear("版本基线")
+        self.metric_grid(self.content, [
+            ("基线编号", f"#{baseline['snapshot_no']}", baseline["created_at"], self.colors["primary"]),
+            ("版本预算", money_text(baseline["version_budget"]), "冻结时预算", self.colors["warning"]),
+            ("需求数量", baseline["requirement_count"], "冻结时需求", self.colors["success"]),
+            ("实际消耗", money_text(baseline["actual_cost"]), f"已分配 {money_text(baseline['allocated_budget'])}", None),
+        ], columns=4)
+        self.add_table(self.content, [("requirement_code", "需求编号", 130), ("requirement_name", "需求名称", 240), ("status", "状态", 100), ("priority", "优先级", 80), ("allocated_budget", "分配预算", 110), ("actual_cost", "实际消耗", 110)], rows, 14)
 
     def compare_versions(self):
         version_options = list(self.versions.keys())
@@ -1000,17 +1376,18 @@ class App(tk.Tk):
         self.clear("跨版本比对")
         left = self.db.one("SELECT version_code, version_name, version_budget FROM implementation_versions WHERE id=?", (left_id,))
         right = self.db.one("SELECT version_code, version_name, version_budget FROM implementation_versions WHERE id=?", (right_id,))
-        row = ttk.Frame(self.content)
-        row.pack(fill=tk.X)
-        self.metric_card(row, "基准版本预算", money_text(left["version_budget"]), f"{left['version_code']} {left['version_name']}")
-        self.metric_card(row, "对比版本预算", money_text(right["version_budget"]), f"{right['version_code']} {right['version_name']}")
-        self.metric_card(row, "预算差额", money_text((right["version_budget"] or 0) - (left["version_budget"] or 0)), "对比版本 - 基准版本")
-        left_rows = {r["requirement_code"]: r for r in self.db.query("SELECT requirement_code, requirement_name, status, allocated_budget, actual_cost FROM requirements WHERE is_deleted=0 AND version_id=?", (left_id,))}
-        right_rows = {r["requirement_code"]: r for r in self.db.query("SELECT requirement_code, requirement_name, status, allocated_budget, actual_cost FROM requirements WHERE is_deleted=0 AND version_id=?", (right_id,))}
+        if self.can_view_money():
+            row = ttk.Frame(self.content)
+            row.pack(fill=tk.X)
+            self.metric_card(row, "基准版本预算", money_text(left["version_budget"]), f"{left['version_code']} {left['version_name']}")
+            self.metric_card(row, "对比版本预算", money_text(right["version_budget"]), f"{right['version_code']} {right['version_name']}")
+            self.metric_card(row, "预算差额", money_text((right["version_budget"] or 0) - (left["version_budget"] or 0)), "对比版本 - 基准版本")
+        left_rows = {r["requirement_name"].strip().casefold(): r for r in self.db.query("SELECT requirement_code, requirement_name, status, allocated_budget, actual_cost FROM requirements WHERE is_deleted=0 AND version_id=?", (left_id,))}
+        right_rows = {r["requirement_name"].strip().casefold(): r for r in self.db.query("SELECT requirement_code, requirement_name, status, allocated_budget, actual_cost FROM requirements WHERE is_deleted=0 AND version_id=?", (right_id,))}
         diff_rows = []
-        for code in sorted(set(left_rows) | set(right_rows)):
-            l = left_rows.get(code)
-            r = right_rows.get(code)
+        for key in sorted(set(left_rows) | set(right_rows)):
+            l = left_rows.get(key)
+            r = right_rows.get(key)
             if not l:
                 diff_type = "新增"
             elif not r:
@@ -1021,7 +1398,7 @@ class App(tk.Tk):
                 diff_type = "一致"
             diff_rows.append({
                 "diff_type": diff_type,
-                "requirement_code": code,
+                "requirement_code": f"{l['requirement_code'] if l else '-'} / {r['requirement_code'] if r else '-'}",
                 "left_name": l["requirement_name"] if l else "",
                 "right_name": r["requirement_name"] if r else "",
                 "left_status": l["status"] if l else "",
@@ -1029,11 +1406,17 @@ class App(tk.Tk):
                 "left_budget": l["allocated_budget"] if l else "",
                 "right_budget": r["allocated_budget"] if r else "",
             })
-        self.section_title(self.content, "需求差异", "新增、移除、变更和一致需求一览。")
-        self.add_table(self.content, [("diff_type", "差异类型", 90), ("requirement_code", "需求编号", 130), ("left_name", "基准版本需求", 220), ("right_name", "对比版本需求", 220), ("left_status", "基准状态", 100), ("right_status", "对比状态", 100), ("left_budget", "基准预算", 100), ("right_budget", "对比预算", 100)], diff_rows, 14)
+        self.section_title(self.content, "需求差异", "按标准化需求名称匹配，编号列展示“基准 / 对比”。")
+        columns = [("diff_type", "差异类型", 90), ("requirement_code", "需求编号", 130), ("left_name", "基准版本需求", 220), ("right_name", "对比版本需求", 220), ("left_status", "基准状态", 100), ("right_status", "对比状态", 100)]
+        if self.can_view_money():
+            columns += [("left_budget", "基准预算", 100), ("right_budget", "对比预算", 100)]
+        self.add_table(self.content, columns, diff_rows, 14)
 
     def show_requirements(self):
         self.clear("需求管理")
+        version = self.current_version()
+        if version and version["is_frozen"]:
+            self.notice_banner(self.content, "当前版本已冻结并形成基线。需求核心信息不可直接修改，编辑或删除将自动转入变更申请。", "warning")
         bar = self.make_action_bar(self.content)
         ttk.Button(bar, text="新建需求", command=self.add_requirement, style="Primary.TButton").pack(side=tk.LEFT)
         ttk.Button(bar, text="查看详情", command=self.show_requirement_detail).pack(side=tk.LEFT, padx=(8, 0))
@@ -1041,7 +1424,8 @@ class App(tk.Tk):
         ttk.Button(bar, text="状态流转", command=self.advance_requirement_status).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(bar, text="分配到当前版本", command=self.assign_requirement_to_current_version).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(bar, text="删除需求", command=self.delete_requirement).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(bar, text="导出需求清单", command=self.export_requirements).pack(side=tk.LEFT, padx=(8, 0))
+        if self.can_action("export"):
+            ttk.Button(bar, text="导出需求清单", command=self.export_requirements).pack(side=tk.LEFT, padx=(8, 0))
         filters = ttk.Frame(self.content)
         filters.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(filters, text="范围").pack(side=tk.LEFT)
@@ -1075,10 +1459,12 @@ class App(tk.Tk):
         self.req_tree = self.add_table(self.content, cols, rows, on_double_click=self.show_requirement_detail)
 
     def add_requirement(self):
+        if not self.require_action("requirement_create", "新建需求"):
+            return
         if not self.current_project_id():
             messagebox.showwarning("提示", "请先选择项目")
             return
-        code = "REQ-" + datetime.now().strftime("%Y%m%d%H%M%S")
+        code = "REQ-" + datetime.now().strftime("%Y%m%d%H%M%S%f")
         version_options = ["待规划池"]
         version_options.extend(list(self.versions.keys()))
         d = FieldDialog(self, "新建需求", [
@@ -1086,7 +1472,7 @@ class App(tk.Tk):
             ("proposer_name", "提出人", "text", None), ("owner_name", "对接人", "text", None), ("requirement_type", "需求类型", "combo", ["业务痛点", "功能优化", "运维 Bug", "招投标要求", "验收整改", "客户新增"]),
             ("version_option", "所属版本", "combo", version_options),
             ("tags", "标签", "text", None), ("priority", "优先级", "combo", ["P0", "P1", "P2", "高", "中", "低"]), ("status", "状态", "combo", STATUS_FLOW + EXTRA_STATUSES),
-            ("estimated_budget", "预估预算", "text", None), ("allocated_budget", "分配预算", "text", None), ("actual_cost", "实际消耗", "text", None),
+            ("estimated_budget", "预估预算", "text", None),
             ("planned_finish_date", "预计完成时间", "text", None), ("requirement_description", "需求描述", "memo", None), ("remark", "备注", "memo", None),
         ], {"requirement_code": code, "priority": "P1", "status": "草稿", "version_option": self.selected_version.get() or "待规划池"}, required=["requirement_code", "requirement_name", "requirement_description", "source_role"])
         if d.result:
@@ -1098,16 +1484,22 @@ class App(tk.Tk):
                     messagebox.showwarning("版本已冻结", "目标版本已冻结，请先走变更流程。")
                     return
                 estimated_budget = self.parse_float(d.result["estimated_budget"], "预估预算")
-                allocated_budget = self.parse_float(d.result["allocated_budget"], "分配预算")
-                actual_cost = self.parse_float(d.result["actual_cost"], "实际消耗")
+                planned_finish = normalize_date(d.result["planned_finish_date"], "预计完成时间")
+                if estimated_budget < 0:
+                    raise ValueError("预估预算不能小于 0")
+                allocated_budget = 0
+                actual_cost = 0
                 t = now_text()
-                self.db.execute("""INSERT INTO requirements(requirement_code, requirement_name, requirement_description, source_role, proposer_name, owner_name, project_id, annual_plan_id, version_id,
+                cur = self.db.execute("""INSERT INTO requirements(requirement_code, requirement_name, requirement_description, source_role, proposer_name, owner_name, project_id, annual_plan_id, version_id,
                                    requirement_type, tags, priority, status, estimated_budget, allocated_budget, actual_cost, planned_finish_date, remark, created_at, updated_at)
                                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (d.result["requirement_code"], d.result["requirement_name"], d.result["requirement_description"], d.result["source_role"], d.result["proposer_name"], d.result["owner_name"],
                                  self.current_project_id(), plan_id, version_id, d.result["requirement_type"], d.result["tags"], d.result["priority"], d.result["status"],
-                                 estimated_budget, allocated_budget, actual_cost, d.result["planned_finish_date"], d.result["remark"], t, t))
-                self.db.log(self.current_user, "requirement", None, "create", "", d.result, "新建需求任务")
+                                 estimated_budget, allocated_budget, actual_cost, planned_finish, d.result["remark"], t, t))
+                requirement_id = cur.lastrowid
+                self.db.execute("INSERT INTO requirement_status_history(requirement_id, from_status, to_status, operator_name, transition_note, changed_at) VALUES(?,?,?,?,?,?)",
+                                (requirement_id, "", d.result["status"], self.current_user, "新建需求", t))
+                self.db.log(self.current_user, "requirement", requirement_id, "create", "", d.result, "新建需求任务")
                 self.show_requirements()
             except (ValueError, sqlite3.IntegrityError) as exc:
                 messagebox.showerror("保存失败", str(exc))
@@ -1125,9 +1517,16 @@ class App(tk.Tk):
             return None
 
     def assign_requirement_to_current_version(self):
+        if not self.require_action("requirement_assign", "分配需求到版本"):
+            return
         req_id = self.selected_requirement_id()
         version_id = self.current_version_id()
         if not req_id or not version_id:
+            return
+        req = self.db.one("SELECT version_id FROM requirements WHERE id=?", (req_id,))
+        source_version = self.db.one("SELECT is_frozen FROM implementation_versions WHERE id=?", (req["version_id"],)) if req and req["version_id"] else None
+        if source_version and source_version["is_frozen"] and req["version_id"] != version_id:
+            messagebox.showwarning("源版本已冻结", "不能把需求直接移出已冻结版本，请提交变更申请。")
             return
         version = self.current_version()
         if version and version["is_frozen"]:
@@ -1155,74 +1554,91 @@ class App(tk.Tk):
         if not req:
             messagebox.showwarning("提示", "未找到需求详情")
             return
-        flows = self.db.query("SELECT flow_type, amount, description, occurred_at FROM budget_flows WHERE requirement_id=? ORDER BY occurred_at DESC LIMIT 8", (req_id,))
+        flows = self.db.query("SELECT flow_type, amount, description, occurred_at FROM budget_flows WHERE requirement_id=? ORDER BY occurred_at DESC LIMIT 8", (req_id,)) if self.can_view_money() else []
         artifacts = self.db.query("SELECT artifact_type, artifact_name, version_no, uploaded_at FROM artifacts WHERE related_object_type='需求' AND related_object_id=? ORDER BY uploaded_at DESC LIMIT 8", (req_id,))
-        DetailDialog(self, f"需求详情 - {req['requirement_code']}", [
+        history = self.db.query("SELECT from_status, to_status, operator_name, transition_note, changed_at FROM requirement_status_history WHERE requirement_id=? ORDER BY id DESC LIMIT 12", (req_id,))
+        sections = [
             ("基础信息", [
                 ("需求编号", req["requirement_code"]), ("需求名称", req["requirement_name"]), ("项目", req["project_name"]),
                 ("年度计划", req["plan_name"]), ("所属版本", req["version_name"]), ("来源角色", req["source_role"]),
                 ("提出人", req["proposer_name"]), ("对接人", req["owner_name"]), ("类型", req["requirement_type"]),
                 ("标签", req["tags"]), ("优先级", req["priority"]), ("状态", req["status"]),
             ]),
-            ("资金信息", [
-                ("预估预算", money_text(req["estimated_budget"])), ("分配预算", money_text(req["allocated_budget"])),
-                ("实际消耗", money_text(req["actual_cost"])), ("预计完成", req["planned_finish_date"]),
-                ("实际完成", req["actual_finish_date"]),
-            ]),
+            ("计划信息", [("预计完成", req["planned_finish_date"]), ("实际完成", req["actual_finish_date"])]),
             ("需求描述", [("描述", req["requirement_description"]), ("备注", req["remark"])]),
-            ("最近资金流水", [(f"{f['occurred_at']} {f['flow_type']}", f"{money_text(f['amount'])} {f['description']}") for f in flows] or [("暂无", "")]),
+            ("状态历史", [(h["changed_at"], f"{h['from_status'] or '创建'} -> {h['to_status']} / {h['operator_name'] or ''} / {h['transition_note'] or ''}") for h in history] or [("暂无", "")]),
             ("关联成果物", [(f"{a['artifact_type']} {a['version_no'] or ''}", f"{a['artifact_name']} {a['uploaded_at']}") for a in artifacts] or [("暂无", "")]),
-        ])
+        ]
+        if self.can_view_money():
+            sections.insert(1, ("资金信息", [
+                ("预估预算", money_text(req["estimated_budget"])), ("分配预算", money_text(req["allocated_budget"])),
+                ("实际消耗", money_text(req["actual_cost"])),
+            ]))
+            sections.insert(-1, ("最近资金流水", [(f"{f['occurred_at']} {f['flow_type']}", f"{money_text(f['amount'])} {f['description']}") for f in flows] or [("暂无", "")]))
+        DetailDialog(self, f"需求详情 - {req['requirement_code']}", sections)
 
     def edit_requirement(self):
+        if not self.require_action("requirement_edit", "编辑需求"):
+            return
         req_id = self.selected_requirement_id()
         if not req_id:
             return
         req = self.db.one("SELECT * FROM requirements WHERE id=?", (req_id,))
         version = self.db.one("SELECT is_frozen FROM implementation_versions WHERE id=?", (req["version_id"],)) if req["version_id"] else None
-        if version and version["is_frozen"]:
-            self.create_change_request(req)
-            return
         d = FieldDialog(self, "编辑需求", [
             ("requirement_name", "需求名称", "text", None), ("source_role", "来源角色", "combo", ["客户", "销售", "项目经理", "研发", "运营", "咨询负责人"]),
             ("proposer_name", "提出人", "text", None), ("owner_name", "对接人", "text", None), ("requirement_type", "需求类型", "combo", ["业务痛点", "功能优化", "运维 Bug", "招投标要求", "验收整改", "客户新增"]),
             ("tags", "标签", "text", None), ("priority", "优先级", "combo", ["P0", "P1", "P2", "高", "中", "低"]),
-            ("estimated_budget", "预估预算", "text", None), ("allocated_budget", "分配预算", "text", None), ("actual_cost", "实际消耗", "text", None),
+            ("estimated_budget", "预估预算", "text", None),
             ("planned_finish_date", "预计完成时间", "text", None), ("requirement_description", "需求描述", "memo", None), ("remark", "备注", "memo", None),
         ], dict(req), required=["requirement_name", "requirement_description", "source_role"])
         if not d.result:
             return
         try:
             estimated_budget = self.parse_float(d.result["estimated_budget"], "预估预算")
-            allocated_budget = self.parse_float(d.result["allocated_budget"], "分配预算")
-            actual_cost = self.parse_float(d.result["actual_cost"], "实际消耗")
+            planned_finish = normalize_date(d.result["planned_finish_date"], "预计完成时间")
+            if estimated_budget < 0:
+                raise ValueError("预估预算不能小于 0")
+            if version and version["is_frozen"]:
+                proposed = dict(d.result)
+                proposed["estimated_budget"] = estimated_budget
+                proposed["planned_finish_date"] = planned_finish
+                self.create_change_request(req, "update", proposed)
+                return
+            allocated_budget = float(req["allocated_budget"] or 0)
+            actual_cost = float(req["actual_cost"] or 0)
             before = dict(req)
             self.db.execute("""UPDATE requirements SET requirement_name=?, requirement_description=?, source_role=?, proposer_name=?, owner_name=?,
                                requirement_type=?, tags=?, priority=?, estimated_budget=?, allocated_budget=?, actual_cost=?, planned_finish_date=?, remark=?, updated_at=?
                                WHERE id=?""",
                             (d.result["requirement_name"], d.result["requirement_description"], d.result["source_role"], d.result["proposer_name"], d.result["owner_name"],
-                             d.result["requirement_type"], d.result["tags"], d.result["priority"], estimated_budget, allocated_budget, actual_cost, d.result["planned_finish_date"], d.result["remark"], now_text(), req_id))
+                             d.result["requirement_type"], d.result["tags"], d.result["priority"], estimated_budget, allocated_budget, actual_cost, planned_finish, d.result["remark"], now_text(), req_id))
             self.db.log(self.current_user, "requirement", req_id, "update", before, d.result, "编辑需求任务")
             self.show_requirements()
         except ValueError as exc:
             messagebox.showerror("保存失败", str(exc))
 
-    def create_change_request(self, req):
+    def create_change_request(self, req, change_type="update", proposed=None):
         d = FieldDialog(self, "冻结版本变更申请", [
             ("change_title", "变更标题", "text", None),
             ("change_reason", "变更原因", "memo", None),
             ("impact_scope", "影响范围", "memo", None),
-        ], {"change_title": f"调整需求：{req['requirement_code']} {req['requirement_name']}"}, required=["change_title", "change_reason"])
+        ], {"change_title": f"{'删除' if change_type == 'delete' else '调整'}需求：{req['requirement_code']} {req['requirement_name']}"}, required=["change_title", "change_reason"])
         if not d.result:
             return
         t = now_text()
-        self.db.execute("""INSERT INTO change_requests(version_id, requirement_id, change_title, change_reason, impact_scope, approval_status, requested_by, requested_at)
+        cur = self.db.execute("""INSERT INTO change_requests(version_id, requirement_id, change_title, change_reason, impact_scope, approval_status, requested_by, requested_at)
                            VALUES(?,?,?,?,?,?,?,?)""",
                         (req["version_id"], req["id"], d.result["change_title"], d.result["change_reason"], d.result["impact_scope"], "pending", self.current_user, t))
-        self.db.log(self.current_user, "change_request", req["id"], "create", "", d.result, "冻结版本需求变更申请")
+        change_id = cur.lastrowid
+        self.db.execute("INSERT INTO change_request_payloads(change_request_id, change_type, proposed_value) VALUES(?,?,?)",
+                        (change_id, change_type, json.dumps(proposed or {}, ensure_ascii=False)))
+        self.db.log(self.current_user, "change_request", change_id, "create", "", d.result, "冻结版本需求变更申请")
         messagebox.showinfo("已提交", "当前版本已冻结，变更申请已提交到系统设置中的变更申请列表。")
 
     def delete_requirement(self):
+        if not self.require_action("requirement_delete", "删除需求"):
+            return
         req_id = self.selected_requirement_id()
         if not req_id:
             return
@@ -1230,7 +1646,7 @@ class App(tk.Tk):
         version = self.db.one("SELECT is_frozen FROM implementation_versions WHERE id=?", (req["version_id"],)) if req["version_id"] else None
         if version and version["is_frozen"]:
             messagebox.showwarning("版本已冻结", "冻结版本内需求不能直接删除，请提交变更申请。")
-            self.create_change_request(req)
+            self.create_change_request(req, "delete", {})
             return
         if not messagebox.askyesno("确认删除", f"确定删除需求 {req['requirement_code']}？该操作为软删除，可在数据库日志中追溯。"):
             return
@@ -1239,20 +1655,39 @@ class App(tk.Tk):
         self.show_requirements()
 
     def advance_requirement_status(self):
+        if not self.require_action("status", "需求状态流转"):
+            return
         req_id = self.selected_requirement_id()
         if not req_id:
             return
         req = self.db.one("SELECT * FROM requirements WHERE id=?", (req_id,))
-        d = FieldDialog(self, "状态流转", [("status", "目标状态", "combo", STATUS_FLOW + EXTRA_STATUSES), ("remark", "流转说明", "memo", None)], {"status": req["status"]})
+        targets = STATUS_TRANSITIONS.get(req["status"], [])
+        if not targets:
+            messagebox.showinfo("状态流转", f"状态“{req['status']}”当前没有可执行的后续流转。")
+            return
+        d = FieldDialog(self, "状态流转", [("status", "目标状态", "combo", targets), ("remark", "流转说明", "memo", None)], {"status": targets[0]}, required=["status", "remark"])
         if d.result:
             before = req["status"]
             after = d.result["status"]
-            self.db.execute("UPDATE requirements SET status=?, remark=?, updated_at=?, actual_finish_date=CASE WHEN ?='已关闭' THEN ? ELSE actual_finish_date END WHERE id=?",
-                            (after, d.result["remark"], now_text(), after, now_text()[:10], req_id))
-            self.db.log(self.current_user, "requirement", req_id, "status_change", before, after, f"需求状态流转：{d.result['remark']}")
+            if after not in targets:
+                messagebox.showerror("非法流转", f"不允许从“{before}”直接流转到“{after}”。")
+                return
+            t = now_text()
+            try:
+                changed = self.db.transition_requirement_status(req_id, before, after, d.result["remark"], self.current_user, t)
+            except Exception as exc:
+                messagebox.showerror("状态流转失败", str(exc))
+                return
+            if not changed:
+                messagebox.showwarning("状态冲突", "需求状态已被其他操作更新，请刷新后重试。")
+                return
             self.show_requirements()
 
     def show_budget(self):
+        if not self.can_view_money():
+            messagebox.showwarning("权限不足", "当前角色无权查看项目资金和成本明细。")
+            self.show_dashboard()
+            return
         self.clear("资金管理")
         bar = self.make_action_bar(self.content)
         ttk.Button(bar, text="登记资金流水", command=self.add_budget_flow, style="Primary.TButton").pack(side=tk.LEFT)
@@ -1270,6 +1705,15 @@ class App(tk.Tk):
             ("需求已分配", money_text(r["allocated"] or 0), f"占版本预算 {percent_text(r['allocated'], v['version_budget'] if v else 0)}", None),
             ("实际消耗", money_text(r["cost"] or 0), f"执行率 {percent_text(r['cost'], r['allocated'])}", self.colors["danger"] if (r["cost"] or 0) > (r["allocated"] or 0) and (r["allocated"] or 0) else self.colors["success"]),
         ], columns=5)
+        version_budget = float(v["version_budget"] or 0) if v else 0
+        allocated = float(r["allocated"] or 0)
+        actual_cost = float(r["cost"] or 0)
+        if version_budget and allocated > version_budget:
+            self.notice_banner(self.content, f"预算超支：需求已分配 {money_text(allocated)}，超过版本预算 {money_text(version_budget)}。", "danger")
+        elif allocated and actual_cost > allocated:
+            self.notice_banner(self.content, f"执行超支：实际消耗 {money_text(actual_cost)}，超过已分配预算 {money_text(allocated)}。", "danger")
+        elif version_budget:
+            self.notice_banner(self.content, f"预算状态正常，版本剩余可分配预算 {money_text(version_budget - allocated)}。", "success")
         self.section_title(self.content, "资金四级穿透", "项目总预算 -> 年度预算 -> 版本预算 -> 需求预算/实际消耗。")
         self.draw_budget_flow(project_id, self.current_plan_id(), version_id)
         self.section_title(self.content, "资金流水", "流水可关联到版本或具体需求，用于后续追溯预算调整与实际消耗。")
@@ -1324,6 +1768,8 @@ class App(tk.Tk):
             y += 48
 
     def add_budget_flow(self):
+        if not self.require_action("budget", "登记资金流水"):
+            return
         if not self.current_project_id():
             messagebox.showwarning("提示", "请先选择项目")
             return
@@ -1336,14 +1782,27 @@ class App(tk.Tk):
         if d.result:
             try:
                 t = now_text()
-                code = "BF-" + datetime.now().strftime("%Y%m%d%H%M%S")
+                code = "BF-" + datetime.now().strftime("%Y%m%d%H%M%S%f")
                 amount = self.parse_float(d.result["amount"], "金额")
+                flow_type = d.result["flow_type"]
                 requirement_id = self.id_from_option(d.result["requirement_option"])
-                self.db.execute("INSERT INTO budget_flows(flow_code, project_id, annual_plan_id, version_id, requirement_id, flow_type, amount, description, operator_name, occurred_at, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                                (code, self.current_project_id(), self.current_plan_id(), self.current_version_id(), requirement_id, d.result["flow_type"], amount, d.result["description"], self.current_user, t, t))
+                if flow_type != "调整金额" and amount <= 0:
+                    raise ValueError("金额必须大于 0；只有调整金额允许填写负数。")
+                if flow_type == "调整金额" and amount == 0:
+                    raise ValueError("调整金额不能为 0。")
+                try:
+                    self.db.record_budget_flow(code, self.current_project_id(), self.current_plan_id(), self.current_version_id(), requirement_id,
+                                               flow_type, amount, d.result["description"], self.current_user, t)
+                except ValueError as exc:
+                    if str(exc) != "ACTUAL_OVERRUN":
+                        raise
+                    if not messagebox.askyesno("预算预警", "登记后实际消耗将超过该需求的分配预算，是否仍要继续？"):
+                        return
+                    self.db.record_budget_flow(code, self.current_project_id(), self.current_plan_id(), self.current_version_id(), requirement_id,
+                                               flow_type, amount, d.result["description"], self.current_user, t, allow_actual_overrun=True)
                 self.db.log(self.current_user, "budget_flow", None, "create", "", d.result, "登记资金流水")
                 self.show_budget()
-            except ValueError as exc:
+            except Exception as exc:
                 messagebox.showerror("保存失败", str(exc))
 
     def show_artifacts(self):
@@ -1373,7 +1832,19 @@ class App(tk.Tk):
             rows.append(item)
         self.add_table(self.content, [("artifact_code", "成果物编号", 130), ("artifact_name", "名称", 180), ("stage", "业务阶段", 110), ("artifact_type", "类型", 110), ("related_object_type", "挂载对象", 90), ("related_object_id", "对象ID", 70), ("version_no", "文件版本", 90), ("file_path", "文件路径", 320), ("uploaded_by", "上传人", 90), ("uploaded_at", "上传时间", 150)], rows)
 
+    def validate_artifact_target(self, object_type, object_id):
+        queries = {
+            "项目": ("SELECT id FROM planning_projects WHERE id=?", (object_id,)),
+            "年度": ("SELECT id FROM annual_plans WHERE id=? AND project_id=?", (object_id, self.current_project_id())),
+            "版本": ("SELECT id FROM implementation_versions WHERE id=? AND project_id=?", (object_id, self.current_project_id())),
+            "需求": ("SELECT id FROM requirements WHERE id=? AND project_id=? AND is_deleted=0", (object_id, self.current_project_id())),
+        }
+        sql, params = queries.get(object_type, (None, None))
+        return bool(sql and self.db.one(sql, params))
+
     def add_artifact(self):
+        if not self.require_action("artifact", "挂载成果物"):
+            return
         source = filedialog.askopenfilename(title="选择成果物文件")
         if not source:
             return
@@ -1383,18 +1854,24 @@ class App(tk.Tk):
             ("related_object_id", "对象ID", "text", None), ("version_no", "文件版本", "text", None), ("description", "说明", "memo", None),
         ], {"related_object_type": "版本", "related_object_id": str(self.current_version_id() or self.current_project_id() or ""), "version_no": "v1"}, required=["related_object_type", "related_object_id"])
         if d.result:
-            src = Path(source)
-            code = "ART-" + datetime.now().strftime("%Y%m%d%H%M%S")
-            dest = self.db.attachments_dir / f"{code}{src.suffix}"
-            shutil.copy2(src, dest)
-            t = now_text()
+            dest = None
             try:
+                object_id = self.parse_int(d.result["related_object_id"], "对象ID")
+                if not self.validate_artifact_target(d.result["related_object_type"], object_id):
+                    raise ValueError("挂载对象不存在，或不属于当前项目。")
+                src = Path(source)
+                code = "ART-" + datetime.now().strftime("%Y%m%d%H%M%S%f")
+                dest = self.db.attachments_dir / f"{code}{src.suffix}"
+                shutil.copy2(src, dest)
+                t = now_text()
                 self.db.execute("""INSERT INTO artifacts(artifact_code, artifact_name, artifact_type, file_path, file_ext, file_size, related_object_type, related_object_id, version_no, description, uploaded_by, uploaded_at, created_at)
                                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                (code, src.name, d.result["artifact_type"], str(dest), src.suffix, dest.stat().st_size, d.result["related_object_type"], self.parse_int(d.result["related_object_id"], "对象ID"), d.result["version_no"], d.result["description"], self.current_user, t, t))
+                                (code, src.name, d.result["artifact_type"], str(dest.relative_to(self.db.base_dir)), src.suffix, dest.stat().st_size, d.result["related_object_type"], object_id, d.result["version_no"], d.result["description"], self.current_user, t, t))
                 self.db.log(self.current_user, "artifact", None, "create", source, dest, "挂载成果物文件")
                 self.show_artifacts()
-            except ValueError as exc:
+            except (OSError, ValueError, sqlite3.DatabaseError) as exc:
+                if dest and dest.exists():
+                    dest.unlink()
                 messagebox.showerror("保存失败", str(exc))
 
     def show_search(self):
@@ -1418,7 +1895,11 @@ class App(tk.Tk):
                                     OR r.tags LIKE ? OR p.project_name LIKE ? OR v.version_name LIKE ?
                                 )
                                 ORDER BY r.updated_at DESC""", (like, like, like, like, like, like)) if keyword else []
-        self.add_table(self.content, [("requirement_code", "需求编号", 130), ("requirement_name", "需求名称", 220), ("project_name", "项目", 160), ("plan_name", "年度计划", 160), ("version_name", "版本", 160), ("source_role", "来源", 90), ("owner_name", "对接人", 90), ("tags", "标签", 160), ("priority", "优先级", 70), ("status", "状态", 110), ("allocated_budget", "分配预算", 100), ("actual_cost", "实际消耗", 100), ("updated_at", "更新时间", 150)], rows)
+        columns = [("requirement_code", "需求编号", 130), ("requirement_name", "需求名称", 220), ("project_name", "项目", 160), ("plan_name", "年度计划", 160), ("version_name", "版本", 160), ("source_role", "来源", 90), ("owner_name", "对接人", 90), ("tags", "标签", 160), ("priority", "优先级", 70), ("status", "状态", 110)]
+        if self.can_view_money():
+            columns += [("allocated_budget", "分配预算", 100), ("actual_cost", "实际消耗", 100)]
+        columns.append(("updated_at", "更新时间", 150))
+        self.add_table(self.content, columns, rows)
 
     def show_milestones(self):
         self.clear("流程里程碑")
@@ -1449,18 +1930,28 @@ class App(tk.Tk):
             ttk.Label(self.content, text="提醒：当前版本需求已达到验收/上线条件，请补充验收报告或项目总结。", foreground=self.colors["danger"], background=self.colors["bg"]).pack(anchor="w", pady=(8, 0))
 
     def count_stage_artifacts(self, stage, project_id, version_id):
-        types = [k for k, v in ARTIFACT_STAGE_HINTS.items() if v == stage.split(".", 1)[-1]]
+        stage_name = stage.split(".", 1)[-1]
+        types = [k for k, v in ARTIFACT_STAGE_HINTS.items() if v == stage_name]
         if not types:
             return 0
         placeholders = ",".join(["?"] * len(types))
         params = types[:]
         where = [f"artifact_type IN ({placeholders})"]
-        context = [("项目", project_id), ("年度", self.current_plan_id()), ("版本", version_id)]
-        object_filters = ["(related_object_type=? AND related_object_id=?)" for obj, obj_id in context if obj_id]
-        object_params = [item for obj, obj_id in context if obj_id for item in (obj, obj_id)]
-        if object_filters:
-            where.append("(" + " OR ".join(object_filters) + ")")
-            params.extend(object_params)
+        if stage_name == "宏观规划":
+            where.append("related_object_type='项目' AND related_object_id=?")
+            params.append(project_id or 0)
+        elif stage_name == "规划细化":
+            where.append("related_object_type='年度' AND related_object_id=?")
+            params.append(self.current_plan_id() or 0)
+        elif stage_name == "运维运营":
+            req_ids = [row["id"] for row in self.db.query("SELECT id FROM requirements WHERE version_id=? AND is_deleted=0", (version_id,))] if version_id else []
+            if not req_ids:
+                return 0
+            where.append(f"related_object_type='需求' AND related_object_id IN ({','.join(['?'] * len(req_ids))})")
+            params.extend(req_ids)
+        else:
+            where.append("related_object_type='版本' AND related_object_id=?")
+            params.append(version_id or 0)
         return self.db.one(f"SELECT COUNT(*) c FROM artifacts WHERE {' AND '.join(where)}", tuple(params))["c"]
 
     def missing_acceptance_artifact_count(self):
@@ -1473,12 +1964,17 @@ class App(tk.Tk):
         return 0 if count else 1
 
     def show_exports(self):
+        if not self.can_action("export"):
+            messagebox.showwarning("权限不足", "当前角色无权导出项目数据。")
+            self.show_dashboard()
+            return
         self.clear("报表导出")
         ttk.Button(self.content, text="导出需求清单 CSV", command=self.export_requirements).pack(anchor="w", pady=5)
         ttk.Button(self.content, text="导出资金明细 CSV", command=self.export_budget).pack(anchor="w", pady=5)
         ttk.Button(self.content, text="导出成果物目录 CSV", command=self.export_artifacts).pack(anchor="w", pady=5)
-        ttk.Button(self.content, text="创建本地备份 ZIP", command=self.create_backup).pack(anchor="w", pady=5)
-        ttk.Button(self.content, text="从备份 ZIP 恢复", command=self.restore_backup).pack(anchor="w", pady=5)
+        if self.current_role.get() == "管理员":
+            ttk.Button(self.content, text="创建本地备份 ZIP", command=self.create_backup).pack(anchor="w", pady=5)
+            ttk.Button(self.content, text="从备份 ZIP 恢复", command=self.restore_backup).pack(anchor="w", pady=5)
         ttk.Label(self.content, text=f"导出目录：{self.db.exports_dir}\n备份目录：{self.db.backups_dir}", wraplength=900).pack(anchor="w", pady=(12, 0))
 
     def export_csv(self, name, rows):
@@ -1489,41 +1985,124 @@ class App(tk.Tk):
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=rows[0].keys())
             writer.writeheader()
-            writer.writerows([dict(r) for r in rows])
+            writer.writerows([{key: csv_safe(value) for key, value in dict(r).items()} for r in rows])
         messagebox.showinfo("导出完成", str(path))
 
     def export_requirements(self):
+        if not self.require_action("export", "导出需求清单"):
+            return
         self.export_csv("requirements", self.db.query("SELECT * FROM requirements WHERE is_deleted=0 ORDER BY id DESC"))
 
     def export_budget(self):
+        if not self.require_action("export", "导出资金明细") or not self.can_view_money():
+            return
         self.export_csv("budget_flows", self.db.query("SELECT * FROM budget_flows ORDER BY id DESC"))
 
     def export_artifacts(self):
+        if not self.require_action("export", "导出成果物目录"):
+            return
         self.export_csv("artifacts", self.db.query("SELECT * FROM artifacts ORDER BY id DESC"))
 
     def create_backup(self):
+        if self.current_role.get() != "管理员":
+            messagebox.showwarning("权限不足", "只有管理员视角可以执行本地备份。")
+            return
         backup = self.db.backups_dir / f"backup_{datetime.now().strftime('%Y%m%d%H%M%S')}.zip"
         with zipfile.ZipFile(backup, "w", zipfile.ZIP_DEFLATED) as z:
             z.write(self.db.db_path, "app.db")
+            z.writestr("attachments/", "")
             for file in self.db.attachments_dir.rglob("*"):
                 if file.is_file():
-                    z.write(file, f"attachments/{file.name}")
+                    z.write(file, f"attachments/{file.relative_to(self.db.attachments_dir).as_posix()}")
         self.db.log(self.current_user, "backup", None, "create", "", backup, "创建本地备份")
         messagebox.showinfo("备份完成", str(backup))
 
     def restore_backup(self):
+        if self.current_role.get() != "管理员":
+            messagebox.showwarning("权限不足", "只有管理员视角可以执行本地恢复。")
+            return
         source = filedialog.askopenfilename(title="选择备份 ZIP", filetypes=[("ZIP", "*.zip")])
         if not source:
             return
         if not messagebox.askyesno("确认恢复", "恢复会覆盖当前数据库和附件，请确认已另行备份。是否继续？"):
             return
-        self.db.conn.close()
-        with zipfile.ZipFile(source, "r") as z:
-            z.extractall(self.db.data_dir)
-        messagebox.showinfo("恢复完成", "已恢复备份，请重新启动程序。")
-        self.destroy()
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+        staged_db = self.db.data_dir / f".app.restore.{stamp}.tmp"
+        staged_attachments = self.db.data_dir / f".attachments.restore.{stamp}"
+        old_db = self.db.data_dir / f".app.before_restore.{stamp}"
+        old_attachments = self.db.data_dir / f".attachments.before_restore.{stamp}"
+        connection_closed = False
+        try:
+            with tempfile.TemporaryDirectory(prefix="crm-restore-") as temp_dir:
+                temp_path = Path(temp_dir)
+                with zipfile.ZipFile(source, "r") as z:
+                    names = z.namelist()
+                    if any(Path(name).is_absolute() or ".." in Path(name).parts for name in names):
+                        raise ValueError("备份包含不安全路径。")
+                    if "app.db" not in names:
+                        raise ValueError("备份缺少 app.db。")
+                    z.extractall(temp_path)
+                restored_db = temp_path / "app.db"
+                check_conn = sqlite3.connect(restored_db)
+                integrity = check_conn.execute("PRAGMA integrity_check").fetchone()[0]
+                required = check_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='requirements'").fetchone()
+                check_conn.close()
+                if integrity != "ok" or not required:
+                    raise ValueError("备份数据库完整性或结构校验失败。")
+
+                shutil.copy2(restored_db, staged_db)
+                restored_attachments = temp_path / "attachments"
+                if restored_attachments.exists():
+                    shutil.copytree(restored_attachments, staged_attachments)
+                else:
+                    staged_attachments.mkdir(parents=True)
+
+                safety = self.db.backups_dir / f"before_restore_{stamp}.zip"
+                with zipfile.ZipFile(safety, "w", zipfile.ZIP_DEFLATED) as z:
+                    z.write(self.db.db_path, "app.db")
+                    for file in self.db.attachments_dir.rglob("*"):
+                        if file.is_file():
+                            z.write(file, f"attachments/{file.relative_to(self.db.attachments_dir).as_posix()}")
+
+                self.db.conn.close()
+                connection_closed = True
+                os.replace(self.db.db_path, old_db)
+                os.replace(staged_db, self.db.db_path)
+                os.replace(self.db.attachments_dir, old_attachments)
+                os.replace(staged_attachments, self.db.attachments_dir)
+                try:
+                    old_db.unlink(missing_ok=True)
+                    shutil.rmtree(old_attachments, ignore_errors=True)
+                except OSError:
+                    pass
+            messagebox.showinfo("恢复完成", f"已恢复备份。恢复前快照：{safety}\n请重新启动程序。")
+            self.destroy()
+        except (OSError, ValueError, sqlite3.DatabaseError, zipfile.BadZipFile) as exc:
+            try:
+                if old_db.exists():
+                    if self.db.db_path.exists():
+                        self.db.db_path.unlink()
+                    os.replace(old_db, self.db.db_path)
+                if old_attachments.exists():
+                    if self.db.attachments_dir.exists():
+                        shutil.rmtree(self.db.attachments_dir)
+                    os.replace(old_attachments, self.db.attachments_dir)
+            except OSError as rollback_exc:
+                messagebox.showerror("自动回滚失败", f"请使用恢复前安全快照人工恢复：{rollback_exc}")
+            if staged_db.exists():
+                staged_db.unlink(missing_ok=True)
+            if staged_attachments.exists():
+                shutil.rmtree(staged_attachments, ignore_errors=True)
+            if connection_closed and self.db.db_path.exists():
+                self.db.conn = sqlite3.connect(self.db.db_path)
+                self.db.conn.row_factory = sqlite3.Row
+            messagebox.showerror("恢复失败", f"已尝试自动回滚到恢复前数据。错误：{exc}")
 
     def show_settings(self):
+        if not self.can_action("approve"):
+            messagebox.showwarning("权限不足", "当前角色无权查看变更审批和系统日志。")
+            self.show_dashboard()
+            return
         self.clear("系统设置")
         ttk.Label(self.content, text="本机账号：默认管理员。支持通过右上角角色选择器查看不同角色视图。", style="SubTitle.TLabel").pack(anchor="w", pady=(0, 8))
         self.section_title(self.content, "变更申请", "冻结版本内的需求修改、删除会进入此列表，由管理员或咨询负责人审批。")
@@ -1570,6 +2149,8 @@ class App(tk.Tk):
         self.update_change_request("rejected")
 
     def update_change_request(self, status):
+        if not self.require_action("approve", "审批变更申请"):
+            return
         change_id = self.selected_change_id()
         if not change_id:
             return
@@ -1580,13 +2161,11 @@ class App(tk.Tk):
         action = "通过" if status == "approved" else "驳回"
         if not messagebox.askyesno("确认审批", f"确认{action}该变更申请？"):
             return
-        t = now_text()
-        self.db.execute("UPDATE change_requests SET approval_status=?, approved_by=?, approved_at=? WHERE id=?",
-                        (status, self.current_user, t, change_id))
-        if status == "approved" and change["requirement_id"]:
-            self.db.execute("UPDATE requirements SET status='变更中', updated_at=? WHERE id=?", (t, change["requirement_id"]))
-        self.db.log(self.current_user, "change_request", change_id, status, dict(change), status, f"变更申请{action}")
-        self.show_settings()
+        try:
+            self.db.review_change_request(change_id, status, self.current_user, now_text())
+            self.show_settings()
+        except Exception as exc:
+            messagebox.showerror("审批失败", str(exc))
 
 
 if __name__ == "__main__":

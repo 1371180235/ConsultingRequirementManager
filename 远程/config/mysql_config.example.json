@@ -2,7 +2,16 @@
   "host": "127.0.0.1",
   "port": 3306,
   "user": "crm_user",
-  "password": "请修改为数据库密码",
+  "password": "",
+  "password_env": "CRM_DB_PASSWORD",
   "database": "consulting_requirement_manager",
-  "create_database": true
+  "create_database": false,
+  "seed_demo_data": false,
+  "connect_timeout": 10,
+  "ssl_ca": "",
+  "attachment_storage": "server",
+  "attachments_dir": "/opt/consulting-requirement-manager/attachments",
+  "oss_endpoint": "",
+  "oss_bucket": "",
+  "oss_prefix": "consulting-requirement-manager"
 }
