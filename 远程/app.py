@@ -2,15 +2,20 @@ import csv
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 import secrets
 import re
 import shutil
+import socket
+import subprocess
 import sys
 import tempfile
+import uuid
 import zipfile
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -18,7 +23,8 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "咨询项目全流程需求管理系统"
 APP_VARIANT = "MySQL 远程版"
-APP_VERSION = "1.4.0-mysql"
+APP_VERSION = "1.5.0-mysql"
+HOST_NAME = socket.gethostname()
 MYSQL_CONFIG_FILE = "mysql_config.json"
 STATUS_FLOW = ["草稿", "规划中", "已排期", "研发中", "待验收", "已上线运维", "已关闭"]
 EXTRA_STATUSES = ["已驳回", "已挂起", "已取消", "变更中", "退回修改"]
@@ -102,6 +108,8 @@ ARTIFACT_STAGE_HINTS = {
     "运营反馈": "运维运营",
 }
 PASSWORD_ITERATIONS = 240000
+LOGGER = logging.getLogger("consulting_requirement.runtime")
+AUDIT_LOGGER = logging.getLogger("consulting_requirement.audit")
 
 
 def now_text():
@@ -158,6 +166,145 @@ def app_base_dir():
     return Path(__file__).resolve().parent
 
 
+def env_int(name, default, minimum, maximum):
+    try:
+        return min(maximum, max(minimum, int(os.environ.get(name, default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} 必须是 1/0、true/false、yes/no 或 on/off。")
+
+
+def configure_logging(logs_dir, variant):
+    logs_dir = Path(logs_dir)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    max_bytes = env_int("CRM_LOG_MAX_BYTES", 10 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024)
+    backup_count = env_int("CRM_LOG_BACKUP_COUNT", 30, 1, 365)
+    level_name = os.environ.get("CRM_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    for logger in (LOGGER, AUDIT_LOGGER):
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+            handler.close()
+        logger.propagate = False
+
+    runtime_handler = RotatingFileHandler(logs_dir / "runtime.log", maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+    runtime_handler.setLevel(level)
+    runtime_handler.setFormatter(logging.Formatter(f"%(asctime)s | %(levelname)s | %(process)d | {HOST_NAME} | %(message)s"))
+    error_handler = RotatingFileHandler(logs_dir / "error.log", maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(logging.Formatter(f"%(asctime)s | %(levelname)s | %(process)d | {HOST_NAME} | %(message)s"))
+    # Handler levels control routing. Keep the logger permissive so a CRITICAL
+    # runtime setting cannot suppress ordinary ERROR records in error.log.
+    LOGGER.setLevel(logging.DEBUG)
+    LOGGER.addHandler(runtime_handler)
+    LOGGER.addHandler(error_handler)
+
+    audit_handler = RotatingFileHandler(logs_dir / "audit.log", maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+    audit_handler.setLevel(logging.INFO)
+    audit_handler.setFormatter(logging.Formatter("%(message)s"))
+    AUDIT_LOGGER.setLevel(logging.INFO)
+    AUDIT_LOGGER.addHandler(audit_handler)
+    if os.name != "nt":
+        try:
+            logs_dir.chmod(0o700)
+            for path in [logs_dir / "runtime.log", logs_dir / "error.log", logs_dir / "audit.log"]:
+                path.chmod(0o600)
+        except OSError as exc:
+            LOGGER.warning("log_permission_hardening_failed path=%s reason=%s", logs_dir, exc)
+    LOGGER.info("logging_initialized variant=%s level=%s max_bytes=%s backups=%s", variant, level_name, max_bytes, backup_count)
+    return logs_dir
+
+
+def close_logging():
+    for logger in (LOGGER, AUDIT_LOGGER):
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+            handler.flush()
+            handler.close()
+
+
+def new_event_id():
+    return uuid.uuid4().hex
+
+
+def audit_event(operator, object_type, object_id, operation_type, description, result="success", event_id=None):
+    event_id = event_id or new_event_id()
+    payload = {
+        "timestamp": now_text(),
+        "event_id": event_id,
+        "host": HOST_NAME,
+        "process_id": os.getpid(),
+        "app_version": APP_VERSION,
+        "variant": APP_VARIANT,
+        "operator": str(operator or ""),
+        "object_type": str(object_type or ""),
+        "object_id": object_id,
+        "operation_type": str(operation_type or ""),
+        "description": str(description or ""),
+        "result": result,
+    }
+    AUDIT_LOGGER.info(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    return event_id
+
+
+def sql_summary(sql):
+    return " ".join(str(sql).split())[:160]
+
+
+def log_transaction_exception(name, exc):
+    if isinstance(exc, ValueError):
+        LOGGER.warning("transaction_rejected name=%s reason=%s", name, exc)
+    else:
+        LOGGER.error("transaction_failed name=%s", name, exc_info=True)
+
+
+def verify_directory_writable(folder):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix="crm-health-", dir=folder, delete=False) as handle:
+        path = Path(handle.name)
+        handle.write(b"healthcheck")
+    path.unlink()
+
+
+def validate_restore_archive(archive, required_names=(), required_prefix=None):
+    configured_limit = env_int("CRM_RESTORE_MAX_BYTES", 20 * 1024**3, 1024**2, 1024**4)
+    free_limit = max(0, shutil.disk_usage(tempfile.gettempdir()).free // 2)
+    limit = min(configured_limit, free_limit)
+    total_size = 0
+    names = []
+    for info in archive.infolist():
+        name = info.filename
+        path = Path(name)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("备份包含不安全路径。")
+        if (info.external_attr >> 16) & 0o170000 == 0o120000:
+            raise ValueError("备份包含不允许恢复的符号链接。")
+        total_size += info.file_size
+        if total_size > limit:
+            raise ValueError(f"备份解压后大小超过恢复上限：{limit} 字节。")
+        if info.file_size > 10 * 1024**2 and (info.compress_size == 0 or info.file_size / info.compress_size > 200):
+            raise ValueError("备份包含异常压缩比文件，已拒绝恢复。")
+        names.append(name)
+    if any(name not in names for name in required_names):
+        raise ValueError("备份缺少必要文件。")
+    if required_prefix and not any(name.startswith(required_prefix) for name in names):
+        raise ValueError(f"备份中没有 {required_prefix} 目录。")
+    return names
+
+
 class ExecutionResult:
     def __init__(self, lastrowid=None, rowcount=0):
         self.lastrowid = lastrowid
@@ -168,25 +315,43 @@ class ExecutionResult:
 
 
 class Database:
-    def __init__(self, base_dir: Path):
+    def __init__(self, base_dir: Path, data_dir=None, config_dir=None):
         self.base_dir = base_dir
-        self.data_dir = base_dir / "data"
-        self.config_dir = base_dir / "config"
+        configured_data_dir = data_dir or os.environ.get("CRM_DATA_DIR", "")
+        configured_config_dir = config_dir or os.environ.get("CRM_CONFIG_DIR", "")
+        self.data_dir = Path(configured_data_dir).expanduser().resolve() if configured_data_dir else base_dir / "data"
+        self.config_dir = Path(configured_config_dir).expanduser().resolve() if configured_config_dir else base_dir / "config"
+        if self.data_dir.resolve() == Path(self.data_dir.resolve().anchor):
+            raise RuntimeError("CRM_DATA_DIR 不能配置为磁盘根目录。")
+        if self.config_dir.resolve() == Path(self.config_dir.resolve().anchor):
+            raise RuntimeError("CRM_CONFIG_DIR 不能配置为磁盘根目录。")
         self.attachments_dir = self.data_dir / "attachments"
         self.backups_dir = self.data_dir / "backups"
         self.exports_dir = self.data_dir / "exports"
-        for folder in [self.data_dir, self.config_dir, self.attachments_dir, self.backups_dir, self.exports_dir]:
+        self.logs_dir = self.data_dir / "logs"
+        for folder in [self.data_dir, self.config_dir, self.attachments_dir, self.backups_dir, self.exports_dir, self.logs_dir]:
             folder.mkdir(parents=True, exist_ok=True)
+        configure_logging(self.logs_dir, "MySQL remote")
+        LOGGER.info("database_initializing engine=mysql config=%s", self.config_dir / MYSQL_CONFIG_FILE)
         self.config_path = self.config_dir / MYSQL_CONFIG_FILE
         self.config = self.load_config()
         self.attachment_storage = self.config["attachment_storage"]
         self._oss_bucket = None
+        self._oss_credentials_fingerprint = None
         if self.attachment_storage == "server" and self.config["attachments_dir"]:
             self.attachments_dir = Path(self.config["attachments_dir"]).expanduser()
             resolved_attachments = self.attachments_dir.resolve()
             unsafe_roots = {Path(resolved_attachments.anchor), self.base_dir.resolve(), self.data_dir.resolve()}
             if resolved_attachments in unsafe_roots:
                 raise RuntimeError("attachments_dir 必须是独立附件子目录，不能配置为磁盘根、共享根、应用目录或 data 根目录。")
+            if resolved_attachments.parent == Path(resolved_attachments.anchor) or resolved_attachments == Path.home().resolve():
+                raise RuntimeError("attachments_dir 范围过宽，请配置专用的两级附件子目录。")
+            for protected in [self.base_dir.resolve(), self.data_dir.resolve(), self.config_dir.resolve()]:
+                try:
+                    protected.relative_to(resolved_attachments)
+                    raise RuntimeError("attachments_dir 不能包含应用、数据或配置目录。")
+                except ValueError:
+                    pass
             self.attachments_dir.mkdir(parents=True, exist_ok=True)
         self.storage_name = "MySQL"
         self.db_label = f"mysql://{self.config['user']}@{self.config['host']}:{self.config['port']}/{self.config['database']}"
@@ -206,6 +371,8 @@ class Database:
             "create_database": False,
             "seed_demo_data": False,
             "connect_timeout": 10,
+            "read_timeout": 30,
+            "write_timeout": 30,
             "ssl_ca": "",
             "attachment_storage": "server",
             "attachments_dir": "",
@@ -229,6 +396,8 @@ class Database:
         config["create_database"] = bool(config.get("create_database", False))
         config["seed_demo_data"] = bool(config.get("seed_demo_data", False))
         config["connect_timeout"] = max(3, int(config.get("connect_timeout", 10)))
+        config["read_timeout"] = max(3, int(config.get("read_timeout", 30)))
+        config["write_timeout"] = max(3, int(config.get("write_timeout", 30)))
         config["ssl_ca"] = str(config.get("ssl_ca", "")).strip()
         config["password_env"] = str(config.get("password_env", "CRM_DB_PASSWORD")).strip()
         env_password = os.environ.get(config["password_env"], "") if config["password_env"] else ""
@@ -247,11 +416,14 @@ class Database:
         config["oss_prefix"] = str(config.get("oss_prefix", "consulting-requirement-manager")).strip(" /")
         if config["attachment_storage"] == "oss" and (not config["oss_endpoint"] or not config["oss_bucket"]):
             raise RuntimeError("OSS 模式必须配置 oss_endpoint 和 oss_bucket。")
+        if config["attachment_storage"] == "oss":
+            if not config["oss_endpoint"].lower().startswith("https://"):
+                raise RuntimeError("正式 OSS 连接必须使用 https:// endpoint。")
+            if not config["oss_prefix"] or ".." in config["oss_prefix"].split("/"):
+                raise RuntimeError("oss_prefix 必须是非空且不包含 .. 的业务专用前缀。")
         return config
 
     def get_oss_bucket(self):
-        if self._oss_bucket is not None:
-            return self._oss_bucket
         try:
             import oss2
         except ImportError as exc:
@@ -261,9 +433,25 @@ class Database:
         security_token = os.environ.get("OSS_SECURITY_TOKEN", "")
         if not access_key_id or not access_key_secret:
             raise RuntimeError("OSS 凭据必须通过 OSS_ACCESS_KEY_ID 和 OSS_ACCESS_KEY_SECRET 环境变量提供。")
+        fingerprint = hashlib.sha256(
+            f"{access_key_id}\0{access_key_secret}\0{security_token}".encode("utf-8")
+        ).hexdigest()
+        if self._oss_bucket is not None and self._oss_credentials_fingerprint == fingerprint:
+            return self._oss_bucket
         auth = oss2.StsAuth(access_key_id, access_key_secret, security_token) if security_token else oss2.Auth(access_key_id, access_key_secret)
         self._oss_bucket = oss2.Bucket(auth, self.config["oss_endpoint"], self.config["oss_bucket"])
+        self._oss_credentials_fingerprint = fingerprint
         return self._oss_bucket
+
+    def oss_key_from_path(self, stored_path):
+        prefix = f"oss://{self.config['oss_bucket']}/"
+        if not str(stored_path).startswith(prefix):
+            raise RuntimeError("附件 OSS 路径与当前 Bucket 不一致。")
+        key = str(stored_path)[len(prefix):]
+        required_prefix = self.config["oss_prefix"].rstrip("/") + "/"
+        if not key.startswith(required_prefix):
+            raise RuntimeError("附件 OSS 路径不属于当前系统前缀。")
+        return key
 
     def store_attachment(self, source, code):
         source = Path(source)
@@ -274,15 +462,13 @@ class Database:
             return f"oss://{self.config['oss_bucket']}/{key}"
         destination = self.attachments_dir / filename
         shutil.copy2(source, destination)
-        return str(destination)
+        return filename
 
     def delete_attachment(self, stored_path):
         if not stored_path:
             return
         if stored_path.startswith("oss://"):
-            prefix = f"oss://{self.config['oss_bucket']}/"
-            if stored_path.startswith(prefix):
-                self.get_oss_bucket().delete_object(stored_path[len(prefix):])
+            self.get_oss_bucket().delete_object(self.oss_key_from_path(stored_path))
             return
         path = Path(stored_path)
         if not path.is_absolute():
@@ -293,6 +479,24 @@ class Database:
             raise RuntimeError("拒绝删除附件根目录之外的文件。") from exc
         if path.exists() and path.is_file():
             path.unlink()
+
+    def download_attachment(self, stored_path, destination):
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if stored_path.startswith("oss://"):
+            self.get_oss_bucket().get_object_to_file(self.oss_key_from_path(stored_path), str(destination))
+            return destination
+        source = Path(stored_path)
+        if not source.is_absolute():
+            source = self.attachments_dir / source
+        try:
+            source.resolve().relative_to(self.attachments_dir.resolve())
+        except ValueError as exc:
+            raise RuntimeError("附件路径不在当前服务器附件目录内。") from exc
+        if not source.is_file():
+            raise FileNotFoundError(f"附件不存在：{source}")
+        shutil.copy2(source, destination)
+        return destination
 
     def connect(self):
         try:
@@ -307,6 +511,8 @@ class Database:
             "charset": "utf8mb4",
             "use_unicode": True,
             "connection_timeout": self.config["connect_timeout"],
+            "read_timeout": self.config["read_timeout"],
+            "write_timeout": self.config["write_timeout"],
             "autocommit": True,
         }
         if self.config["ssl_ca"]:
@@ -331,7 +537,29 @@ class Database:
         try:
             self.conn.ping(reconnect=True, attempts=2, delay=1)
         except Exception as exc:
+            LOGGER.exception("mysql_connection_unavailable target=%s", self.db_label)
             raise RuntimeError(f"MySQL 连接不可用：{exc}") from exc
+
+    def begin_transaction(self):
+        self.ensure_connection()
+        self.conn.autocommit = False
+        try:
+            return self.conn.cursor(dictionary=True)
+        except Exception:
+            self.conn.autocommit = True
+            raise
+
+    def end_transaction(self, cursor):
+        try:
+            if cursor is not None:
+                cursor.close()
+        except Exception:
+            LOGGER.exception("mysql_transaction_cursor_close_failed")
+        finally:
+            try:
+                self.conn.autocommit = True
+            except Exception:
+                LOGGER.exception("mysql_autocommit_restore_failed")
 
     def mysql_sql(self, sql):
         sql = sql.replace("?", "%s")
@@ -344,30 +572,366 @@ class Database:
         try:
             cur.execute(self.mysql_sql(sql), params)
             return ExecutionResult(cur.lastrowid, cur.rowcount)
+        except Exception:
+            LOGGER.exception("mysql_execute_failed sql=%s", sql_summary(sql))
+            raise
         finally:
             cur.close()
 
     def query(self, sql, params=()):
         self.ensure_connection()
         cur = self.conn.cursor(dictionary=True)
-        cur.execute(self.mysql_sql(sql), params)
-        rows = cur.fetchall()
-        cur.close()
-        return rows
+        try:
+            cur.execute(self.mysql_sql(sql), params)
+            return cur.fetchall()
+        except Exception:
+            LOGGER.exception("mysql_query_failed sql=%s", sql_summary(sql))
+            raise
+        finally:
+            cur.close()
 
     def one(self, sql, params=()):
         self.ensure_connection()
         cur = self.conn.cursor(dictionary=True)
-        cur.execute(self.mysql_sql(sql), params)
-        row = cur.fetchone()
-        cur.close()
-        return row
+        try:
+            cur.execute(self.mysql_sql(sql), params)
+            return cur.fetchone()
+        except Exception:
+            LOGGER.exception("mysql_query_one_failed sql=%s", sql_summary(sql))
+            raise
+        finally:
+            cur.close()
+
+    def close(self):
+        try:
+            self.conn.close()
+            LOGGER.info("database_connection_closed engine=mysql")
+        except Exception:
+            LOGGER.exception("database_close_failed engine=mysql")
+
+    def healthcheck(self):
+        server = self.one("""SELECT VERSION() mysql_version,
+                                    @@character_set_database database_charset,
+                                    @@collation_database database_collation,
+                                    @@session.time_zone session_time_zone,
+                                    @@session.sql_mode sql_mode,
+                                    @@session.transaction_isolation transaction_isolation""")
+        version_match = re.match(r"(\d+)", str(server["mysql_version"]))
+        if "mariadb" in str(server["mysql_version"]).lower() or not version_match or int(version_match.group(1)) != 8:
+            raise RuntimeError(f"远程版要求 MySQL 8.x，当前版本：{server['mysql_version']}")
+        if str(server["database_charset"]).lower() != "utf8mb4":
+            raise RuntimeError(f"数据库字符集必须为 utf8mb4，当前：{server['database_charset']}")
+        if env_bool("CRM_REQUIRE_STRICT_SQL", True) and not any(
+            mode in str(server["sql_mode"]).upper() for mode in ["STRICT_TRANS_TABLES", "STRICT_ALL_TABLES"]
+        ):
+            raise RuntimeError("MySQL 未启用严格 SQL mode。")
+        ssl_status = self.one("SHOW STATUS LIKE 'Ssl_cipher'") or {}
+        ssl_cipher = ssl_status.get("Value") or ssl_status.get("value") or ""
+        require_tls = env_bool("CRM_REQUIRE_TLS", False)
+        if self.config["ssl_ca"] and not ssl_cipher:
+            raise RuntimeError("已配置 ssl_ca，但当前 MySQL 会话未使用 TLS。")
+        if require_tls and (not self.config["ssl_ca"] or not ssl_cipher):
+            raise RuntimeError("CRM_REQUIRE_TLS=1，但未建立经过 CA 校验的 TLS 会话。")
+        required_tables = [
+            "planning_projects", "annual_plans", "implementation_versions", "requirements",
+            "budget_flows", "artifacts", "users", "operation_logs", "version_baselines",
+            "user_project_access",
+        ]
+        for table in required_tables:
+            self.one(f"SELECT 1 probe FROM {table} LIMIT 1")
+        self.one("SELECT event_id, result FROM operation_logs LIMIT 1")
+        for folder in [self.data_dir, self.backups_dir, self.exports_dir, self.logs_dir]:
+            verify_directory_writable(folder)
+        minimum_free = env_int("CRM_MIN_FREE_BYTES", 512 * 1024 * 1024, 0, 10 * 1024 * 1024 * 1024 * 1024)
+        free_bytes = shutil.disk_usage(self.data_dir).free
+        if free_bytes < minimum_free:
+            raise RuntimeError(f"磁盘剩余空间低于阈值：{free_bytes} < {minimum_free}")
+        if self.attachment_storage == "server":
+            verify_directory_writable(self.attachments_dir)
+            attachment = {
+                "storage": "server",
+                "target": str(self.attachments_dir),
+                "free_bytes": shutil.disk_usage(self.attachments_dir).free,
+            }
+        else:
+            bucket = self.get_oss_bucket()
+            key = "/".join(part for part in [
+                self.config["oss_prefix"], "_healthchecks", HOST_NAME,
+                datetime.now().strftime("%Y%m%d%H%M%S%f") + ".txt",
+            ] if part)
+            uploaded = False
+            try:
+                bucket.put_object(key, b"healthcheck")
+                uploaded = True
+            finally:
+                if uploaded:
+                    bucket.delete_object(key)
+            attachment = {"storage": "oss", "target": f"oss://{self.config['oss_bucket']}/{self.config['oss_prefix']}"}
+        return {
+            **server,
+            "tls_required": require_tls,
+            "tls_cipher": ssl_cipher,
+            "database": self.db_label,
+            "data_dir": str(self.data_dir),
+            "free_bytes": free_bytes,
+            "attachment": attachment,
+        }
+
+    def create_requirement(self, record, operator_name, occurred_at):
+        cur = self.begin_transaction()
+        try:
+            version_id = record.get("version_id")
+            if version_id:
+                cur.execute("SELECT id, project_id, annual_plan_id, is_frozen FROM implementation_versions WHERE id=%s FOR UPDATE", (version_id,))
+                version = cur.fetchone()
+                if not version:
+                    raise ValueError("目标版本不存在。")
+                if version["is_frozen"]:
+                    raise ValueError("目标版本已冻结，请提交变更申请。")
+                if version["project_id"] != record.get("project_id") or version["annual_plan_id"] != record.get("annual_plan_id"):
+                    raise ValueError("需求的项目、年度计划与目标版本不一致。")
+            cur.execute("""INSERT INTO requirements(requirement_code, requirement_name, requirement_description,
+                               source_role, proposer_name, owner_name, project_id, annual_plan_id, version_id,
+                               requirement_type, tags, priority, status, estimated_budget, allocated_budget,
+                               actual_cost, planned_finish_date, remark, created_at, updated_at)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        tuple(record[key] for key in [
+                            "requirement_code", "requirement_name", "requirement_description", "source_role",
+                            "proposer_name", "owner_name", "project_id", "annual_plan_id", "version_id",
+                            "requirement_type", "tags", "priority", "status", "estimated_budget",
+                            "allocated_budget", "actual_cost", "planned_finish_date", "remark", "created_at", "updated_at",
+                        ]))
+            requirement_id = cur.lastrowid
+            cur.execute("""INSERT INTO requirement_status_history(requirement_id, from_status, to_status,
+                                                                    operator_name, transition_note, changed_at)
+                           VALUES(%s,'',%s,%s,'新建需求',%s)""",
+                        (requirement_id, record["status"], operator_name, occurred_at))
+            event_id = new_event_id()
+            cur.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                       operation_type, before_value, after_value, description,
+                                                       event_id, result)
+                           VALUES(%s,%s,'requirement',%s,'create','',%s,'新建需求任务',%s,'success')""",
+                        (operator_name, occurred_at, requirement_id,
+                         json.dumps(record, ensure_ascii=False, default=str), event_id))
+            self.conn.commit()
+            audit_event(operator_name, "requirement", requirement_id, "create", "新建需求任务", event_id=event_id)
+            return requirement_id
+        except Exception as exc:
+            self.conn.rollback()
+            log_transaction_exception("create_requirement", exc)
+            raise
+        finally:
+            self.end_transaction(cur)
+
+    def update_requirement(self, requirement_id, record, operator_name, occurred_at):
+        current = self.one("SELECT version_id FROM requirements WHERE id=? AND is_deleted=0", (requirement_id,))
+        if not current:
+            raise ValueError("需求不存在或已删除。")
+        expected_version_id = current["version_id"]
+        cur = self.begin_transaction()
+        try:
+            if expected_version_id:
+                cur.execute("SELECT is_frozen FROM implementation_versions WHERE id=%s FOR UPDATE", (expected_version_id,))
+                version = cur.fetchone()
+                if not version:
+                    raise ValueError("需求所属版本不存在。")
+                if version["is_frozen"]:
+                    raise ValueError("VERSION_FROZEN")
+            cur.execute("SELECT * FROM requirements WHERE id=%s AND is_deleted=0 FOR UPDATE", (requirement_id,))
+            before = cur.fetchone()
+            if not before or before["version_id"] != expected_version_id:
+                raise ValueError("需求所属版本已被其他操作更新，请刷新后重试。")
+            cur.execute("""UPDATE requirements SET requirement_name=%s, requirement_description=%s,
+                               source_role=%s, proposer_name=%s, owner_name=%s, requirement_type=%s, tags=%s,
+                               priority=%s, estimated_budget=%s, planned_finish_date=%s, remark=%s, updated_at=%s
+                           WHERE id=%s AND is_deleted=0""",
+                        (record["requirement_name"], record["requirement_description"], record["source_role"],
+                         record.get("proposer_name", ""), record.get("owner_name", ""), record.get("requirement_type", ""),
+                         record.get("tags", ""), record.get("priority", "P1"), record["estimated_budget"],
+                         record.get("planned_finish_date"), record.get("remark", ""), occurred_at, requirement_id))
+            if cur.rowcount != 1:
+                raise ValueError("需求已被其他操作更新，请刷新后重试。")
+            event_id = new_event_id()
+            cur.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                       operation_type, before_value, after_value, description,
+                                                       event_id, result)
+                           VALUES(%s,%s,'requirement',%s,'update',%s,%s,'编辑需求任务',%s,'success')""",
+                        (operator_name, occurred_at, requirement_id, json.dumps(before, ensure_ascii=False, default=str),
+                         json.dumps(record, ensure_ascii=False, default=str), event_id))
+            self.conn.commit()
+            audit_event(operator_name, "requirement", requirement_id, "update", "编辑需求任务", event_id=event_id)
+            return before
+        except Exception as exc:
+            self.conn.rollback()
+            log_transaction_exception("update_requirement", exc)
+            raise
+        finally:
+            self.end_transaction(cur)
+
+    def assign_requirement(self, requirement_id, target_version_id, annual_plan_id, operator_name, occurred_at):
+        current = self.one("SELECT version_id, project_id FROM requirements WHERE id=? AND is_deleted=0", (requirement_id,))
+        if not current:
+            raise ValueError("需求不存在或已删除。")
+        expected_source_id = current["version_id"]
+        cur = self.begin_transaction()
+        try:
+            versions = {}
+            for version_id in sorted({value for value in [expected_source_id, target_version_id] if value}):
+                cur.execute("SELECT id, project_id, annual_plan_id, is_frozen FROM implementation_versions WHERE id=%s FOR UPDATE", (version_id,))
+                versions[version_id] = cur.fetchone()
+                if not versions[version_id]:
+                    raise ValueError("关联版本不存在。")
+            if expected_source_id and versions[expected_source_id]["is_frozen"] and expected_source_id != target_version_id:
+                raise ValueError("源版本已冻结，不能直接移出需求。")
+            if versions[target_version_id]["is_frozen"]:
+                raise ValueError("目标版本已冻结，不能直接分配需求。")
+            if versions[target_version_id]["annual_plan_id"] != annual_plan_id:
+                raise ValueError("目标版本与年度计划不一致。")
+            if versions[target_version_id]["project_id"] != current["project_id"]:
+                raise ValueError("目标版本与需求所属项目不一致。")
+            cur.execute("SELECT version_id, project_id FROM requirements WHERE id=%s AND is_deleted=0 FOR UPDATE", (requirement_id,))
+            locked = cur.fetchone()
+            if not locked or locked["version_id"] != expected_source_id or locked["project_id"] != current["project_id"]:
+                raise ValueError("需求所属版本已被其他操作更新，请刷新后重试。")
+            cur.execute("UPDATE requirements SET annual_plan_id=%s, version_id=%s, updated_at=%s WHERE id=%s AND is_deleted=0",
+                        (annual_plan_id, target_version_id, occurred_at, requirement_id))
+            event_id = new_event_id()
+            cur.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                       operation_type, before_value, after_value, description,
+                                                       event_id, result)
+                           VALUES(%s,%s,'requirement',%s,'assign_version',%s,%s,'需求分配到当前版本',%s,'success')""",
+                        (operator_name, occurred_at, requirement_id, str(expected_source_id or ""), str(target_version_id), event_id))
+            self.conn.commit()
+            audit_event(operator_name, "requirement", requirement_id, "assign_version", "需求分配到当前版本", event_id=event_id)
+        except Exception as exc:
+            self.conn.rollback()
+            log_transaction_exception("assign_requirement", exc)
+            raise
+        finally:
+            self.end_transaction(cur)
+
+    def soft_delete_requirement(self, requirement_id, operator_name, occurred_at):
+        current = self.one("SELECT version_id FROM requirements WHERE id=? AND is_deleted=0", (requirement_id,))
+        if not current:
+            raise ValueError("需求不存在或已删除。")
+        expected_version_id = current["version_id"]
+        cur = self.begin_transaction()
+        try:
+            if expected_version_id:
+                cur.execute("SELECT is_frozen FROM implementation_versions WHERE id=%s FOR UPDATE", (expected_version_id,))
+                version = cur.fetchone()
+                if not version:
+                    raise ValueError("需求所属版本不存在。")
+                if version["is_frozen"]:
+                    raise ValueError("VERSION_FROZEN")
+            cur.execute("SELECT * FROM requirements WHERE id=%s AND is_deleted=0 FOR UPDATE", (requirement_id,))
+            before = cur.fetchone()
+            if not before or before["version_id"] != expected_version_id:
+                raise ValueError("需求所属版本已变化，请刷新后重试。")
+            cur.execute("UPDATE requirements SET is_deleted=1, updated_at=%s WHERE id=%s AND is_deleted=0",
+                        (occurred_at, requirement_id))
+            if cur.rowcount != 1:
+                raise ValueError("需求已被其他操作删除，请刷新后重试。")
+            event_id = new_event_id()
+            cur.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                       operation_type, before_value, after_value, description,
+                                                       event_id, result)
+                           VALUES(%s,%s,'requirement',%s,'delete',%s,'','软删除需求',%s,'success')""",
+                        (operator_name, occurred_at, requirement_id,
+                         json.dumps(before, ensure_ascii=False, default=str), event_id))
+            self.conn.commit()
+            audit_event(operator_name, "requirement", requirement_id, "delete", "软删除需求", event_id=event_id)
+            return before
+        except Exception as exc:
+            self.conn.rollback()
+            log_transaction_exception("soft_delete_requirement", exc)
+            raise
+        finally:
+            self.end_transaction(cur)
+
+    def create_change_request_record(self, requirement_id, change_type, proposed, values, operator_name, occurred_at):
+        cur = self.begin_transaction()
+        try:
+            cur.execute("SELECT version_id FROM requirements WHERE id=%s AND is_deleted=0", (requirement_id,))
+            probe = cur.fetchone()
+            if not probe or not probe["version_id"]:
+                raise ValueError("只有已分配到冻结版本的需求才能提交变更申请。")
+            cur.execute("SELECT is_frozen FROM implementation_versions WHERE id=%s FOR UPDATE", (probe["version_id"],))
+            version = cur.fetchone()
+            if not version or not version["is_frozen"]:
+                raise ValueError("目标版本尚未冻结，请直接编辑需求。")
+            cur.execute("SELECT id, version_id FROM requirements WHERE id=%s AND is_deleted=0 FOR UPDATE", (requirement_id,))
+            requirement = cur.fetchone()
+            if not requirement or requirement["version_id"] != probe["version_id"]:
+                raise ValueError("需求所属版本已变化，请刷新后重试。")
+            cur.execute("""INSERT INTO change_requests(version_id, requirement_id, change_title, change_reason,
+                                                        impact_scope, approval_status, requested_by, requested_at)
+                           VALUES(%s,%s,%s,%s,%s,'pending',%s,%s)""",
+                        (probe["version_id"], requirement_id, values["change_title"], values["change_reason"],
+                         values.get("impact_scope", ""), operator_name, occurred_at))
+            change_id = cur.lastrowid
+            cur.execute("INSERT INTO change_request_payloads(change_request_id, change_type, proposed_value) VALUES(%s,%s,%s)",
+                        (change_id, change_type, json.dumps(proposed or {}, ensure_ascii=False, default=str)))
+            event_id = new_event_id()
+            cur.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                       operation_type, before_value, after_value, description,
+                                                       event_id, result)
+                           VALUES(%s,%s,'change_request',%s,'create','',%s,'冻结版本需求变更申请',%s,'success')""",
+                        (operator_name, occurred_at, change_id, json.dumps(values, ensure_ascii=False, default=str), event_id))
+            self.conn.commit()
+            audit_event(operator_name, "change_request", change_id, "create", "冻结版本需求变更申请", event_id=event_id)
+            return change_id
+        except Exception as exc:
+            self.conn.rollback()
+            log_transaction_exception("create_change_request", exc)
+            raise
+        finally:
+            self.end_transaction(cur)
+
+    def create_artifact_record(self, record, operator_name, occurred_at):
+        cur = self.begin_transaction()
+        try:
+            target_checks = {
+                "项目": "SELECT id FROM planning_projects WHERE id=%s FOR UPDATE",
+                "年度": "SELECT id FROM annual_plans WHERE id=%s FOR UPDATE",
+                "版本": "SELECT id FROM implementation_versions WHERE id=%s FOR UPDATE",
+                "需求": "SELECT id FROM requirements WHERE id=%s AND is_deleted=0 FOR UPDATE",
+            }
+            target_sql = target_checks.get(record["related_object_type"])
+            if not target_sql:
+                raise ValueError("成果物挂载对象类型无效。")
+            cur.execute(target_sql, (record["related_object_id"],))
+            if not cur.fetchone():
+                raise ValueError("成果物挂载对象不存在、已删除或已被其他操作更新。")
+            cur.execute("""INSERT INTO artifacts(artifact_code, artifact_name, artifact_type, file_path, file_ext,
+                                                  file_size, related_object_type, related_object_id, version_no,
+                                                  description, uploaded_by, uploaded_at, created_at)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        tuple(record[key] for key in [
+                            "artifact_code", "artifact_name", "artifact_type", "file_path", "file_ext", "file_size",
+                            "related_object_type", "related_object_id", "version_no", "description", "uploaded_by",
+                            "uploaded_at", "created_at",
+                        ]))
+            artifact_id = cur.lastrowid
+            event_id = new_event_id()
+            cur.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                       operation_type, before_value, after_value, description,
+                                                       event_id, result)
+                           VALUES(%s,%s,'artifact',%s,'create','',%s,'挂载成果物文件',%s,'success')""",
+                        (operator_name, occurred_at, artifact_id, record["file_path"], event_id))
+            self.conn.commit()
+            audit_event(operator_name, "artifact", artifact_id, "create", "挂载成果物文件", event_id=event_id)
+            return artifact_id
+        except Exception as exc:
+            self.conn.rollback()
+            log_transaction_exception("create_artifact_record", exc)
+            raise
+        finally:
+            self.end_transaction(cur)
 
     def record_budget_flow(self, flow_code, project_id, annual_plan_id, version_id, requirement_id,
                            flow_type, amount, description, operator_name, occurred_at, allow_actual_overrun=False):
-        self.ensure_connection()
-        self.conn.autocommit = False
-        cur = self.conn.cursor(dictionary=True)
+        cur = self.begin_transaction()
         try:
             req = None
             version = None
@@ -409,18 +973,23 @@ class Database:
                 cur.execute("UPDATE requirements SET allocated_budget=allocated_budget+%s, updated_at=%s WHERE id=%s", (amount, occurred_at, requirement_id))
             elif req and flow_type == "实际消耗":
                 cur.execute("UPDATE requirements SET actual_cost=actual_cost+%s, updated_at=%s WHERE id=%s", (amount, occurred_at, requirement_id))
+            event_id = new_event_id()
+            cur.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                       operation_type, before_value, after_value, description,
+                                                       event_id, result)
+                           VALUES(%s,%s,'budget_flow',%s,'create','',%s,%s,%s,'success')""",
+                        (operator_name, occurred_at, requirement_id, flow_code, f"登记资金流水：{flow_type}", event_id))
             self.conn.commit()
-        except Exception:
+            audit_event(operator_name, "budget_flow", requirement_id, "create", f"登记资金流水：{flow_type}", event_id=event_id)
+        except Exception as exc:
             self.conn.rollback()
+            log_transaction_exception("record_budget_flow", exc)
             raise
         finally:
-            cur.close()
-            self.conn.autocommit = True
+            self.end_transaction(cur)
 
     def freeze_version_with_baseline(self, version_id, operator_name, occurred_at):
-        self.ensure_connection()
-        self.conn.autocommit = False
-        cur = self.conn.cursor(dictionary=True)
+        cur = self.begin_transaction()
         try:
             cur.execute("SELECT * FROM implementation_versions WHERE id=%s FOR UPDATE", (version_id,))
             version = cur.fetchone()
@@ -452,26 +1021,27 @@ class Database:
                            WHERE id=%s AND is_frozen=0""", (occurred_at, version_id))
             if cur.rowcount != 1:
                 raise ValueError("版本冻结状态已被其他操作更新，请刷新后重试。")
+            event_id = new_event_id()
             cur.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
-                                                       operation_type, before_value, after_value, description)
-                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                                                       operation_type, before_value, after_value, description,
+                                                       event_id, result)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'success')""",
                         (operator_name, occurred_at, "implementation_version", version_id, "freeze", "",
-                         f"baseline:{baseline_id}", f"冻结版本并生成基线 #{snapshot_no}"))
+                         f"baseline:{baseline_id}", f"冻结版本并生成基线 #{snapshot_no}", event_id))
             self.conn.commit()
+            audit_event(operator_name, "implementation_version", version_id, "freeze", f"冻结版本并生成基线 #{snapshot_no}", event_id=event_id)
             return {"baseline_id": baseline_id, "snapshot_no": snapshot_no}
-        except Exception:
+        except Exception as exc:
             self.conn.rollback()
+            log_transaction_exception("freeze_version", exc)
             raise
         finally:
-            cur.close()
-            self.conn.autocommit = True
+            self.end_transaction(cur)
 
     def review_change_request(self, change_id, status, operator_name, occurred_at):
         if status not in {"approved", "rejected"}:
             raise ValueError("无效的审批状态。")
-        self.ensure_connection()
-        self.conn.autocommit = False
-        cur = self.conn.cursor(dictionary=True)
+        cur = self.begin_transaction()
         try:
             cur.execute("SELECT * FROM change_requests WHERE id=%s FOR UPDATE", (change_id,))
             change = cur.fetchone()
@@ -481,6 +1051,8 @@ class Database:
                 raise ValueError("该变更申请已被其他操作处理，请刷新后重试。")
             cur.execute("SELECT * FROM change_request_payloads WHERE change_request_id=%s", (change_id,))
             payload = cur.fetchone()
+            if status == "approved" and change["requirement_id"] and not payload:
+                raise ValueError("变更申请缺少变更内容，不能审批通过。")
             if status == "approved" and change["requirement_id"] and payload:
                 cur.execute("SELECT * FROM requirements WHERE id=%s FOR UPDATE", (change["requirement_id"],))
                 requirement = cur.fetchone()
@@ -518,28 +1090,29 @@ class Database:
                            WHERE id=%s AND approval_status='pending'""", (status, operator_name, occurred_at, change_id))
             if cur.rowcount != 1:
                 raise ValueError("该变更申请已被其他操作处理，请刷新后重试。")
+            event_id = new_event_id()
             cur.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
-                                                       operation_type, before_value, after_value, description)
-                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                                                       operation_type, before_value, after_value, description,
+                                                       event_id, result)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'success')""",
                         (operator_name, occurred_at, "change_request", change_id, status,
-                         str(change), status, "变更申请通过" if status == "approved" else "变更申请驳回"))
+                         str(change), status, "变更申请通过" if status == "approved" else "变更申请驳回", event_id))
             self.conn.commit()
+            audit_event(operator_name, "change_request", change_id, status, "变更申请通过" if status == "approved" else "变更申请驳回", event_id=event_id)
             return change
-        except Exception:
+        except Exception as exc:
             self.conn.rollback()
+            log_transaction_exception("review_change_request", exc)
             raise
         finally:
-            cur.close()
-            self.conn.autocommit = True
+            self.end_transaction(cur)
 
     def transition_requirement_status(self, requirement_id, from_status, to_status, note, operator_name, occurred_at):
         if to_status not in STATUS_TRANSITIONS.get(from_status, []):
             raise ValueError(f"不允许从“{from_status}”直接流转到“{to_status}”。")
         if not str(note or "").strip():
             raise ValueError("状态流转说明不能为空。")
-        self.ensure_connection()
-        self.conn.autocommit = False
-        cur = self.conn.cursor(dictionary=True)
+        cur = self.begin_transaction()
         try:
             cur.execute("SELECT status FROM requirements WHERE id=%s AND is_deleted=0 FOR UPDATE", (requirement_id,))
             requirement = cur.fetchone()
@@ -557,18 +1130,21 @@ class Database:
                                                                    operator_name, transition_note, changed_at)
                            VALUES(%s,%s,%s,%s,%s,%s)""",
                         (requirement_id, from_status, to_status, operator_name, note, occurred_at))
+            event_id = new_event_id()
             cur.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
-                                                       operation_type, before_value, after_value, description)
-                           VALUES(%s,%s,'requirement',%s,'status_change',%s,%s,%s)""",
-                        (operator_name, occurred_at, requirement_id, from_status, to_status, f"需求状态流转：{note}"))
+                                                       operation_type, before_value, after_value, description,
+                                                       event_id, result)
+                           VALUES(%s,%s,'requirement',%s,'status_change',%s,%s,%s,%s,'success')""",
+                        (operator_name, occurred_at, requirement_id, from_status, to_status, f"需求状态流转：{note}", event_id))
             self.conn.commit()
+            audit_event(operator_name, "requirement", requirement_id, "status_change", f"{from_status} -> {to_status}", event_id=event_id)
             return True
-        except Exception:
+        except Exception as exc:
             self.conn.rollback()
+            log_transaction_exception("transition_requirement_status", exc)
             raise
         finally:
-            cur.close()
-            self.conn.autocommit = True
+            self.end_transaction(cur)
 
     def init_schema(self):
         statements = [
@@ -712,7 +1288,10 @@ class Database:
                 before_value MEDIUMTEXT,
                 after_value MEDIUMTEXT,
                 description TEXT,
-                INDEX idx_log_time(operation_time)
+                event_id VARCHAR(40),
+                result VARCHAR(20) DEFAULT 'success',
+                INDEX idx_log_time(operation_time),
+                UNIQUE KEY uk_log_event_id(event_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
             """
@@ -791,17 +1370,55 @@ class Database:
             """,
         ]
         cur = self.conn.cursor()
-        for statement in statements:
-            cur.execute(statement)
-        self.conn.commit()
-        cur.close()
+        lock_name = f"crm_schema_{self.config['database']}"[:64]
+        lock_acquired = False
+        try:
+            cur.execute("SELECT GET_LOCK(%s, 30)", (lock_name,))
+            lock_acquired = cur.fetchone()[0] == 1
+            if not lock_acquired:
+                raise RuntimeError("等待数据库结构升级锁超时，请稍后重试。")
+            for statement in statements:
+                cur.execute(statement)
+            cur.execute("SHOW COLUMNS FROM operation_logs LIKE 'event_id'")
+            event_column = cur.fetchone()
+            if not event_column:
+                cur.execute("ALTER TABLE operation_logs ADD COLUMN event_id VARCHAR(40)")
+            elif str(event_column[1]).lower() != "varchar(40)":
+                cur.execute("ALTER TABLE operation_logs MODIFY COLUMN event_id VARCHAR(40) NULL")
+            cur.execute("SHOW COLUMNS FROM operation_logs LIKE 'result'")
+            result_column = cur.fetchone()
+            if not result_column:
+                cur.execute("ALTER TABLE operation_logs ADD COLUMN result VARCHAR(20) DEFAULT 'legacy'")
+            elif str(result_column[1]).lower() != "varchar(20)" or str(result_column[4] or "").lower() != "success":
+                cur.execute("ALTER TABLE operation_logs MODIFY COLUMN result VARCHAR(20) DEFAULT 'success'")
+            cur.execute("UPDATE operation_logs SET result='legacy' WHERE event_id IS NULL")
+            if not result_column:
+                cur.execute("ALTER TABLE operation_logs MODIFY COLUMN result VARCHAR(20) DEFAULT 'success'")
+            cur.execute("SHOW INDEX FROM operation_logs WHERE Key_name='uk_log_event_id'")
+            event_index = cur.fetchone()
+            if event_index and int(event_index[1]) != 0:
+                cur.execute("ALTER TABLE operation_logs DROP INDEX uk_log_event_id")
+                event_index = None
+            if not event_index:
+                cur.execute("ALTER TABLE operation_logs ADD UNIQUE INDEX uk_log_event_id(event_id)")
+            self.conn.commit()
+        finally:
+            if lock_acquired:
+                try:
+                    cur.execute("SELECT RELEASE_LOCK(%s)", (lock_name,))
+                    cur.fetchone()
+                except Exception:
+                    LOGGER.exception("schema_lock_release_failed lock=%s", lock_name)
+            cur.close()
 
     def seed_defaults(self):
+        initialized = []
         if not self.one("SELECT id FROM users WHERE username='admin'"):
             self.execute(
                 "INSERT INTO users(username, display_name, password_hash, role_name, created_at, updated_at) VALUES(?,?,?,?,?,?)",
                 ("admin", "默认管理员", "", "管理员", now_text(), now_text()),
             )
+            initialized.append("默认管理员")
         if self.config["seed_demo_data"] and not self.one("SELECT id FROM planning_projects"):
             t = now_text()
             self.execute(
@@ -826,19 +1443,25 @@ class Database:
                 ("REQ-DEMO-001", "建立统一需求池", "将客户、销售、研发、运营等来源的需求统一登记并跟踪状态。", "咨询负责人", "咨询负责人", "默认管理员",
                  project_id, plan_id, version_id, "功能优化", "版本必做,待确认", "P0", "规划中", 80000, 60000, 12000, t, t),
             )
+            initialized.append("演示业务数据")
         if not self.one("SELECT id FROM requirement_status_history LIMIT 1"):
             for row in self.query("SELECT id, status, created_at FROM requirements WHERE is_deleted=0"):
                 self.execute(
                     "INSERT INTO requirement_status_history(requirement_id, from_status, to_status, operator_name, transition_note, changed_at) VALUES(?,?,?,?,?,?)",
                     (row["id"], "", row["status"], "系统", "初始化需求状态历史", row["created_at"]),
                 )
-        self.log("系统", "system", None, "init", "", "", "初始化数据库和默认数据")
+            initialized.append("需求状态历史")
+        if initialized:
+            self.log("系统", "system", None, "init", "", "", "初始化：" + "、".join(initialized))
 
-    def log(self, operator, object_type, object_id, operation_type, before_value, after_value, description):
+    def log(self, operator, object_type, object_id, operation_type, before_value, after_value, description, result="success"):
+        event_id = new_event_id()
         self.execute(
-            "INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id, operation_type, before_value, after_value, description) VALUES(?,?,?,?,?,?,?,?)",
-            (operator, now_text(), object_type, object_id, operation_type, str(before_value or ""), str(after_value or ""), description),
+            "INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id, operation_type, before_value, after_value, description, event_id, result) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (operator, now_text(), object_type, object_id, operation_type, str(before_value or ""), str(after_value or ""), description, event_id, result),
         )
+        audit_event(operator, object_type, object_id, operation_type, description, result=result, event_id=event_id)
+        return event_id
 
 
 class DetailDialog(tk.Toplevel):
@@ -994,6 +1617,8 @@ class CredentialDialog(tk.Toplevel):
 
 class App(tk.Tk):
     def __init__(self, skip_login=False):
+        if skip_login and os.environ.get("CRM_MYSQL_INTEGRATION_SELFTEST") != "1":
+            raise RuntimeError("skip_login 仅允许 CRM_MYSQL_INTEGRATION_SELFTEST=1 的集成测试使用。")
         super().__init__()
         self.base_dir = app_base_dir()
         self.db = Database(self.base_dir)
@@ -1012,15 +1637,58 @@ class App(tk.Tk):
         self.requirement_scope = tk.StringVar(value="当前版本")
         self.requirement_status_filter = tk.StringVar(value="全部状态")
         self.change_status_filter = tk.StringVar(value="全部")
+        self.operation_log_type_filter = tk.StringVar(value="全部")
+        self.operation_log_keyword = tk.StringVar()
         self.content = None
         self.current_page = "首页工作台"
         self.configure_style()
         if not skip_login and not self.authenticate():
+            LOGGER.info("login_cancelled")
+            self.db.close()
+            close_logging()
             self.destroy()
             raise SystemExit("登录已取消")
         self.build_layout()
         self.refresh_contexts()
         self.show_dashboard()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        LOGGER.info("application_started version=%s variant=mysql user=%s role=%s", APP_VERSION, self.current_username, self.current_role.get())
+
+    def report_callback_exception(self, exc_type, exc_value, exc_traceback):
+        LOGGER.error("unhandled_tk_callback", exc_info=(exc_type, exc_value, exc_traceback))
+        messagebox.showerror("系统错误", f"操作执行失败：{exc_value}\n详细信息已写入：{self.db.logs_dir / 'error.log'}")
+
+    def open_logs_directory(self):
+        try:
+            if os.name == "nt":
+                os.startfile(str(self.db.logs_dir))
+            else:
+                subprocess.Popen(["xdg-open", str(self.db.logs_dir)])
+        except Exception as exc:
+            LOGGER.exception("open_logs_directory_failed path=%s", self.db.logs_dir)
+            messagebox.showerror("打开失败", str(exc))
+
+    def run_healthcheck(self):
+        try:
+            details = self.db.healthcheck()
+            self.db.log(self.current_user, "healthcheck", None, "check", "", "success", "MySQL 远程版部署健康检查通过")
+            LOGGER.info("healthcheck_succeeded variant=mysql")
+            messagebox.showinfo("健康检查通过", json.dumps(details, ensure_ascii=False, indent=2))
+        except Exception as exc:
+            LOGGER.exception("healthcheck_failed variant=mysql")
+            try:
+                self.db.log(self.current_user, "healthcheck", None, "check", "", "failed",
+                            "MySQL 远程版部署健康检查失败", result="failed")
+            except Exception:
+                audit_event(self.current_user, "healthcheck", None, "check", "MySQL 远程版部署健康检查失败", result="failed")
+            messagebox.showerror("健康检查失败", f"{exc}\n请查看 {self.db.logs_dir / 'error.log'}")
+
+    def on_close(self):
+        LOGGER.info("application_stopping user=%s role=%s", self.current_username, self.current_role.get())
+        self.db.close()
+        LOGGER.info("application_stopped")
+        close_logging()
+        self.destroy()
 
     def authenticate(self):
         self.withdraw()
@@ -1031,12 +1699,22 @@ class App(tk.Tk):
                 if len(initial) < 8:
                     messagebox.showerror("配置错误", "CRM_INITIAL_ADMIN_PASSWORD 至少需要 8 位。")
                     return False
-                self.db.execute("UPDATE users SET password_hash=?, updated_at=? WHERE id=?", (hash_password(initial), now_text(), admin["id"]))
+                changed = self.db.execute("UPDATE users SET password_hash=?, updated_at=? WHERE id=? AND (password_hash IS NULL OR password_hash='')",
+                                          (hash_password(initial), now_text(), admin["id"]))
+                if changed.rowcount != 1:
+                    messagebox.showwarning("初始化冲突", "管理员密码已由另一客户端初始化，请使用最新密码登录。")
+                else:
+                    self.db.log("系统", "user", admin["id"], "initialize_password", "", "", "初始化管理员密码")
             else:
                 setup = CredentialDialog(self, setup=True)
                 if not setup.result:
                     return False
-                self.db.execute("UPDATE users SET password_hash=?, updated_at=? WHERE id=?", (hash_password(setup.result[1]), now_text(), admin["id"]))
+                changed = self.db.execute("UPDATE users SET password_hash=?, updated_at=? WHERE id=? AND (password_hash IS NULL OR password_hash='')",
+                                          (hash_password(setup.result[1]), now_text(), admin["id"]))
+                if changed.rowcount != 1:
+                    messagebox.showwarning("初始化冲突", "管理员密码已由另一客户端初始化，请使用最新密码登录。")
+                else:
+                    self.db.log("系统", "user", admin["id"], "initialize_password", "", "", "初始化管理员密码")
         while True:
             dialog = CredentialDialog(self)
             if not dialog.result:
@@ -1048,8 +1726,17 @@ class App(tk.Tk):
                 self.current_username = user["username"]
                 self.current_user = user["display_name"]
                 self.current_role.set(user["role_name"])
+                self.db.log(self.current_user, "authentication", user["id"], "login", "", "", "用户登录成功")
                 self.deiconify()
                 return True
+            try:
+                self.db.log(username or "未知用户", "authentication", None, "login_failed", "", "denied",
+                            "用户名、密码错误或账号停用", result="denied")
+            except Exception:
+                LOGGER.exception("central_login_failure_audit_failed username=%s", username)
+                audit_event(username or "未知用户", "authentication", None, "login_failed",
+                            "用户名、密码错误或账号停用", result="denied")
+            LOGGER.warning("login_failed username=%s", username)
             messagebox.showerror("登录失败", "用户名或密码错误，或账号已停用。")
 
     def configure_style(self):
@@ -1228,6 +1915,14 @@ class App(tk.Tk):
     def require_action(self, action, label):
         if self.can_action(action):
             return True
+        description = f"{self.current_role.get()} 无权执行：{label}"
+        try:
+            self.db.log(self.current_username, "permission", self.current_user_id, "denied", "", action,
+                        description, result="denied")
+        except Exception:
+            LOGGER.exception("central_permission_audit_failed user=%s action=%s", self.current_username, action)
+            audit_event(self.current_username, "permission", self.current_user_id, "denied", description, result="denied")
+        LOGGER.warning("permission_denied user=%s role=%s action=%s label=%s", self.current_username, self.current_role.get(), action, label)
         messagebox.showwarning("权限不足", f"当前角色“{self.current_role.get()}”无权执行：{label}")
         return False
 
@@ -1903,17 +2598,13 @@ class App(tk.Tk):
                 allocated_budget = 0
                 actual_cost = 0
                 t = now_text()
-                cur = self.db.execute("""INSERT INTO requirements(requirement_code, requirement_name, requirement_description, source_role, proposer_name, owner_name, project_id, annual_plan_id, version_id,
-                                   requirement_type, tags, priority, status, estimated_budget, allocated_budget, actual_cost, planned_finish_date, remark, created_at, updated_at)
-                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                (d.result["requirement_code"], d.result["requirement_name"], d.result["requirement_description"], d.result["source_role"], d.result["proposer_name"], d.result["owner_name"],
-                                 self.current_project_id(), plan_id, version_id, d.result["requirement_type"], d.result["tags"], d.result["priority"], d.result["status"],
-                                 estimated_budget, allocated_budget, actual_cost, planned_finish, d.result["remark"], t, t))
-                requirement_id = cur.lastrowid
-                cur.close()
-                self.db.execute("INSERT INTO requirement_status_history(requirement_id, from_status, to_status, operator_name, transition_note, changed_at) VALUES(?,?,?,?,?,?)",
-                                (requirement_id, "", d.result["status"], self.current_user, "新建需求", t))
-                self.db.log(self.current_user, "requirement", requirement_id, "create", "", d.result, "新建需求任务")
+                record = {
+                    **d.result,
+                    "project_id": self.current_project_id(), "annual_plan_id": plan_id, "version_id": version_id,
+                    "estimated_budget": estimated_budget, "allocated_budget": allocated_budget, "actual_cost": actual_cost,
+                    "planned_finish_date": planned_finish, "created_at": t, "updated_at": t,
+                }
+                self.db.create_requirement(record, self.current_user, t)
                 self.show_requirements()
             except Exception as exc:
                 messagebox.showerror("保存失败", str(exc))
@@ -1946,9 +2637,11 @@ class App(tk.Tk):
         if version and version["is_frozen"]:
             messagebox.showwarning("版本已冻结", "当前版本已冻结，请先走变更流程。")
             return
-        self.db.execute("UPDATE requirements SET annual_plan_id=?, version_id=?, updated_at=? WHERE id=?",
-                        (self.current_plan_id(), version_id, now_text(), req_id))
-        self.db.log(self.current_user, "requirement", req_id, "assign_version", "", version_id, "需求分配到当前版本")
+        try:
+            self.db.assign_requirement(req_id, version_id, self.current_plan_id(), self.current_user, now_text())
+        except Exception as exc:
+            messagebox.showerror("分配失败", str(exc))
+            return
         self.requirement_scope.set("当前版本")
         self.show_requirements()
 
@@ -2019,18 +2712,15 @@ class App(tk.Tk):
                 proposed["planned_finish_date"] = planned_finish
                 self.create_change_request(req, "update", proposed)
                 return
-            allocated_budget = float(req["allocated_budget"] or 0)
-            actual_cost = float(req["actual_cost"] or 0)
-            before = dict(req)
-            self.db.execute("""UPDATE requirements SET requirement_name=?, requirement_description=?, source_role=?, proposer_name=?, owner_name=?,
-                               requirement_type=?, tags=?, priority=?, estimated_budget=?, allocated_budget=?, actual_cost=?, planned_finish_date=?, remark=?, updated_at=?
-                               WHERE id=?""",
-                            (d.result["requirement_name"], d.result["requirement_description"], d.result["source_role"], d.result["proposer_name"], d.result["owner_name"],
-                             d.result["requirement_type"], d.result["tags"], d.result["priority"], estimated_budget, allocated_budget, actual_cost, planned_finish, d.result["remark"], now_text(), req_id))
-            self.db.log(self.current_user, "requirement", req_id, "update", before, d.result, "编辑需求任务")
+            record = {**d.result, "estimated_budget": estimated_budget, "planned_finish_date": planned_finish}
+            self.db.update_requirement(req_id, record, self.current_user, now_text())
             self.show_requirements()
         except ValueError as exc:
-            messagebox.showerror("保存失败", str(exc))
+            if str(exc) == "VERSION_FROZEN":
+                proposed = {**d.result, "estimated_budget": estimated_budget, "planned_finish_date": planned_finish}
+                self.create_change_request(req, "update", proposed)
+            else:
+                messagebox.showerror("保存失败", str(exc))
 
     def create_change_request(self, req, change_type="update", proposed=None):
         d = FieldDialog(self, "冻结版本变更申请", [
@@ -2040,16 +2730,11 @@ class App(tk.Tk):
         ], {"change_title": f"{'删除' if change_type == 'delete' else '调整'}需求：{req['requirement_code']} {req['requirement_name']}"}, required=["change_title", "change_reason"])
         if not d.result:
             return
-        t = now_text()
-        cur = self.db.execute("""INSERT INTO change_requests(version_id, requirement_id, change_title, change_reason, impact_scope, approval_status, requested_by, requested_at)
-                           VALUES(?,?,?,?,?,?,?,?)""",
-                        (req["version_id"], req["id"], d.result["change_title"], d.result["change_reason"], d.result["impact_scope"], "pending", self.current_user, t))
-        change_id = cur.lastrowid
-        cur.close()
-        self.db.execute("INSERT INTO change_request_payloads(change_request_id, change_type, proposed_value) VALUES(?,?,?)",
-                        (change_id, change_type, json.dumps(proposed or {}, ensure_ascii=False)))
-        self.db.log(self.current_user, "change_request", change_id, "create", "", d.result, "冻结版本需求变更申请")
-        messagebox.showinfo("已提交", "当前版本已冻结，变更申请已提交到系统设置中的变更申请列表。")
+        try:
+            self.db.create_change_request_record(req["id"], change_type, proposed, d.result, self.current_user, now_text())
+            messagebox.showinfo("已提交", "当前版本已冻结，变更申请已提交到系统设置中的变更申请列表。")
+        except Exception as exc:
+            messagebox.showerror("提交失败", str(exc))
 
     def delete_requirement(self):
         if not self.require_action("requirement_delete", "删除需求"):
@@ -2065,9 +2750,14 @@ class App(tk.Tk):
             return
         if not messagebox.askyesno("确认删除", f"确定删除需求 {req['requirement_code']}？该操作为软删除，可在数据库日志中追溯。"):
             return
-        self.db.execute("UPDATE requirements SET is_deleted=1, updated_at=? WHERE id=?", (now_text(), req_id))
-        self.db.log(self.current_user, "requirement", req_id, "delete", dict(req), "", "软删除需求")
-        self.show_requirements()
+        try:
+            self.db.soft_delete_requirement(req_id, self.current_user, now_text())
+            self.show_requirements()
+        except ValueError as exc:
+            if str(exc) == "VERSION_FROZEN":
+                self.create_change_request(req, "delete", {})
+            else:
+                messagebox.showerror("删除失败", str(exc))
 
     def advance_requirement_status(self):
         if not self.require_action("status", "需求状态流转"):
@@ -2215,7 +2905,6 @@ class App(tk.Tk):
                         return
                     self.db.record_budget_flow(code, self.current_project_id(), self.current_plan_id(), self.current_version_id(), requirement_id,
                                                flow_type, amount, d.result["description"], self.current_user, t, allow_actual_overrun=True)
-                self.db.log(self.current_user, "budget_flow", None, "create", "", d.result, "登记资金流水")
                 self.show_budget()
             except Exception as exc:
                 messagebox.showerror("保存失败", str(exc))
@@ -2224,6 +2913,7 @@ class App(tk.Tk):
         self.clear("成果物管理")
         bar = self.make_action_bar(self.content)
         ttk.Button(bar, text="挂载本地文件", command=self.add_artifact, style="Primary.TButton").pack(side=tk.LEFT)
+        ttk.Button(bar, text="打开/下载附件", command=self.open_selected_artifact).pack(side=tk.LEFT, padx=(8, 0))
         context_ids = [
             ("项目", self.current_project_id()),
             ("年度", self.current_plan_id()),
@@ -2245,7 +2935,43 @@ class App(tk.Tk):
             item = dict(r)
             item["stage"] = ARTIFACT_STAGE_HINTS.get(item["artifact_type"], "其他")
             rows.append(item)
-        self.add_table(self.content, [("artifact_code", "成果物编号", 130), ("artifact_name", "名称", 180), ("stage", "业务阶段", 110), ("artifact_type", "类型", 110), ("related_object_type", "挂载对象", 90), ("related_object_id", "对象ID", 70), ("version_no", "文件版本", 90), ("file_path", "文件路径", 320), ("uploaded_by", "上传人", 90), ("uploaded_at", "上传时间", 150)], rows)
+        self.artifact_tree = self.add_table(self.content, [("artifact_code", "成果物编号", 130), ("artifact_name", "名称", 180), ("stage", "业务阶段", 110), ("artifact_type", "类型", 110), ("related_object_type", "挂载对象", 90), ("related_object_id", "对象ID", 70), ("version_no", "文件版本", 90), ("file_path", "文件路径", 320), ("uploaded_by", "上传人", 90), ("uploaded_at", "上传时间", 150)], rows, on_double_click=self.open_selected_artifact)
+
+    def selected_artifact(self):
+        selection = getattr(self, "artifact_tree", None).selection() if hasattr(self, "artifact_tree") else ()
+        if not selection:
+            messagebox.showwarning("提示", "请先选择一个成果物。")
+            return None
+        artifact_code = self.artifact_tree.item(selection[0])["values"][0]
+        return self.db.one("SELECT id, artifact_code, artifact_name, file_path FROM artifacts WHERE artifact_code=?", (artifact_code,))
+
+    def open_selected_artifact(self, _event=None):
+        artifact = self.selected_artifact()
+        if not artifact:
+            return
+        try:
+            if artifact["file_path"].startswith("oss://"):
+                destination = filedialog.asksaveasfilename(title="下载成果物", initialfile=artifact["artifact_name"])
+                if not destination:
+                    return
+                self.db.download_attachment(artifact["file_path"], destination)
+                self.db.log(self.current_user, "artifact", artifact["id"], "download", "", destination, "下载 OSS 成果物附件")
+                messagebox.showinfo("下载完成", destination)
+                return
+            path = Path(artifact["file_path"])
+            if not path.is_absolute():
+                path = self.db.attachments_dir / path
+            path.resolve().relative_to(self.db.attachments_dir.resolve())
+            if not path.is_file():
+                raise FileNotFoundError(f"附件不存在：{path}")
+            if os.name == "nt":
+                os.startfile(str(path))
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+            self.db.log(self.current_user, "artifact", artifact["id"], "open", "", artifact["file_path"], "打开服务器成果物附件")
+        except Exception as exc:
+            LOGGER.exception("open_or_download_artifact_failed code=%s", artifact["artifact_code"])
+            messagebox.showerror("附件操作失败", str(exc))
 
     def validate_artifact_target(self, object_type, object_id):
         queries = {
@@ -2269,7 +2995,8 @@ class App(tk.Tk):
             ("related_object_id", "对象ID", "text", None), ("version_no", "文件版本", "text", None), ("description", "说明", "memo", None),
         ], {"related_object_type": "版本", "related_object_id": str(self.current_version_id() or self.current_project_id() or ""), "version_no": "v1"}, required=["related_object_type", "related_object_id"])
         if d.result:
-            dest = None
+            stored_path = None
+            artifact_id = None
             try:
                 object_id = self.parse_int(d.result["related_object_id"], "对象ID")
                 if not self.validate_artifact_target(d.result["related_object_type"], object_id):
@@ -2278,18 +3005,24 @@ class App(tk.Tk):
                 code = "ART-" + datetime.now().strftime("%Y%m%d%H%M%S%f")
                 stored_path = self.db.store_attachment(src, code)
                 t = now_text()
-                self.db.execute("""INSERT INTO artifacts(artifact_code, artifact_name, artifact_type, file_path, file_ext, file_size, related_object_type, related_object_id, version_no, description, uploaded_by, uploaded_at, created_at)
-                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                (code, src.name, d.result["artifact_type"], stored_path, src.suffix, src.stat().st_size, d.result["related_object_type"], object_id, d.result["version_no"], d.result["description"], self.current_user, t, t))
-                self.db.log(self.current_user, "artifact", None, "create", source, stored_path, "挂载成果物文件")
-                self.show_artifacts()
+                record = {
+                    "artifact_code": code, "artifact_name": src.name, "artifact_type": d.result["artifact_type"],
+                    "file_path": stored_path, "file_ext": src.suffix, "file_size": src.stat().st_size,
+                    "related_object_type": d.result["related_object_type"], "related_object_id": object_id,
+                    "version_no": d.result["version_no"], "description": d.result["description"],
+                    "uploaded_by": self.current_user, "uploaded_at": t, "created_at": t,
+                }
+                artifact_id = self.db.create_artifact_record(record, self.current_user, t)
             except Exception as exc:
-                if 'stored_path' in locals():
+                log_transaction_exception("add_artifact", exc)
+                if stored_path and artifact_id is None:
                     try:
                         self.db.delete_attachment(stored_path)
                     except Exception:
-                        pass
+                        LOGGER.exception("attachment_cleanup_failed path=%s", stored_path)
                 messagebox.showerror("保存失败", str(exc))
+                return
+            self.show_artifacts()
 
     def show_search(self):
         self.clear("搜索中心")
@@ -2405,7 +3138,7 @@ class App(tk.Tk):
         if self.current_role.get() == "管理员":
             ttk.Button(self.content, text="创建附件备份 ZIP", command=self.create_backup).pack(anchor="w", pady=5)
             ttk.Button(self.content, text="从附件备份 ZIP 恢复", command=self.restore_backup).pack(anchor="w", pady=5)
-        ttk.Label(self.content, text=f"导出目录：{self.db.exports_dir}\n备份目录：{self.db.backups_dir}", wraplength=900).pack(anchor="w", pady=(12, 0))
+        ttk.Label(self.content, text=f"导出目录：{self.db.exports_dir}\n备份目录：{self.db.backups_dir}\n日志目录：{self.db.logs_dir}", wraplength=900).pack(anchor="w", pady=(12, 0))
 
     def export_csv(self, name, rows):
         path = self.db.exports_dir / f"{name}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
@@ -2447,7 +3180,7 @@ class App(tk.Tk):
             z.writestr("config_snapshot.json", json.dumps(safe_config, ensure_ascii=False, indent=2))
             z.writestr("attachments/", "")
             for file in self.db.attachments_dir.rglob("*"):
-                if file.is_file():
+                if file.is_file() and not file.is_symlink():
                     z.write(file, f"attachments/{file.relative_to(self.db.attachments_dir).as_posix()}")
         self.db.log(self.current_user, "backup", None, "create", "", backup, "创建本地备份")
         messagebox.showinfo("备份完成", str(backup))
@@ -2471,11 +3204,7 @@ class App(tk.Tk):
             with tempfile.TemporaryDirectory(prefix="crm-attachments-") as temp_dir:
                 temp_path = Path(temp_dir)
                 with zipfile.ZipFile(source, "r") as z:
-                    names = z.namelist()
-                    if any(Path(name).is_absolute() or ".." in Path(name).parts for name in names):
-                        raise ValueError("备份包含不安全路径。")
-                    if not any(name.startswith("attachments/") for name in names):
-                        raise ValueError("备份中没有 attachments 目录。")
+                    validate_restore_archive(z, required_prefix="attachments/")
                     z.extractall(temp_path)
                 restored = temp_path / "attachments"
                 shutil.copytree(restored, staged)
@@ -2483,7 +3212,7 @@ class App(tk.Tk):
                 with zipfile.ZipFile(safety, "w", zipfile.ZIP_DEFLATED) as z:
                     z.writestr("attachments/", "")
                     for file in self.db.attachments_dir.rglob("*"):
-                        if file.is_file():
+                        if file.is_file() and not file.is_symlink():
                             z.write(file, f"attachments/{file.relative_to(self.db.attachments_dir).as_posix()}")
                 os.replace(self.db.attachments_dir, old)
                 os.replace(staged, self.db.attachments_dir)
@@ -2491,12 +3220,14 @@ class App(tk.Tk):
             self.db.log(self.current_user, "attachment_backup", None, "restore", source, self.db.attachments_dir, "恢复客户端附件备份")
             messagebox.showinfo("恢复完成", "服务器目录附件已恢复；MySQL 数据库未变更。")
         except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            log_transaction_exception("restore_attachment_backup", exc)
             try:
                 if old.exists():
                     if self.db.attachments_dir.exists():
                         shutil.rmtree(self.db.attachments_dir)
                     os.replace(old, self.db.attachments_dir)
             except OSError as rollback_exc:
+                LOGGER.exception("attachment_restore_rollback_failed")
                 messagebox.showerror("自动回滚失败", f"请使用恢复前附件快照人工恢复：{rollback_exc}")
             if staged.exists():
                 shutil.rmtree(staged, ignore_errors=True)
@@ -2509,6 +3240,11 @@ class App(tk.Tk):
             return
         self.clear("系统设置")
         ttk.Label(self.content, text=f"当前账号：{self.current_user}（{self.current_role.get()}）。角色权限由登录账号决定。", style="SubTitle.TLabel").pack(anchor="w", pady=(0, 8))
+        self.section_title(self.content, "运行日志", "客户端运行、错误和审计日志按大小分卷；MySQL 操作日志仍可在本页查询。")
+        log_bar = self.make_action_bar(self.content)
+        ttk.Button(log_bar, text="打开日志目录", command=self.open_logs_directory).pack(side=tk.LEFT)
+        ttk.Button(log_bar, text="运行健康检查", command=self.run_healthcheck).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(log_bar, text=f"{self.db.logs_dir}  |  runtime.log / error.log / audit.log").pack(side=tk.LEFT, padx=(10, 0))
         if self.current_role.get() == "管理员":
             self.section_title(self.content, "用户与角色", "管理员可创建账号并启用或停用；密码仅保存 PBKDF2 哈希。")
             user_bar = self.make_action_bar(self.content)
@@ -2547,9 +3283,45 @@ class App(tk.Tk):
                                     {where}
                                     ORDER BY c.id DESC LIMIT 80""", params)
         self.change_tree = self.add_table(self.content, [("id", "ID", 50), ("approval_status", "状态", 90), ("version_code", "版本", 90), ("requirement_code", "需求编号", 130), ("change_title", "标题", 260), ("requested_by", "申请人", 90), ("requested_at", "申请时间", 150), ("approved_by", "审批人", 90), ("approved_at", "审批时间", 150)], changes, 8)
-        self.section_title(self.content, "操作日志", "记录关键数据修改、状态流转、版本冻结、成果物上传和备份等动作。")
-        rows = self.db.query("SELECT operator_name, operation_time, object_type, object_id, operation_type, description FROM operation_logs ORDER BY id DESC LIMIT 80")
-        self.add_table(self.content, [("operator_name", "操作人", 100), ("operation_time", "时间", 150), ("object_type", "对象", 120), ("object_id", "对象ID", 70), ("operation_type", "操作", 120), ("description", "说明", 360)], rows, 10)
+        self.section_title(self.content, "操作日志", "集中记录关键业务操作、登录成功/失败和权限拒绝；事件 ID 可与客户端 audit.log 对账。")
+        audit_bar = self.make_action_bar(self.content)
+        ttk.Label(audit_bar, text="对象类型").pack(side=tk.LEFT)
+        type_box = ttk.Combobox(audit_bar, textvariable=self.operation_log_type_filter,
+                                values=["全部", "system", "authentication", "permission", "user", "user_project_access", "planning_project", "annual_plan", "implementation_version", "requirement", "budget_flow", "artifact", "change_request", "backup", "healthcheck"],
+                                state="readonly", width=22)
+        type_box.pack(side=tk.LEFT, padx=(6, 10))
+        type_box.bind("<<ComboboxSelected>>", lambda _e: self.show_settings())
+        ttk.Label(audit_bar, text="关键词").pack(side=tk.LEFT)
+        ttk.Entry(audit_bar, textvariable=self.operation_log_keyword, width=24).pack(side=tk.LEFT, padx=(6, 8))
+        ttk.Button(audit_bar, text="查询", command=self.show_settings).pack(side=tk.LEFT)
+        ttk.Button(audit_bar, text="导出审计 CSV", command=self.export_operation_logs).pack(side=tk.LEFT, padx=(8, 0))
+        rows = self.filtered_operation_logs(limit=200)
+        self.add_table(self.content, [("operation_time", "时间", 150), ("operator_name", "操作人", 100), ("object_type", "对象", 110), ("operation_type", "操作", 110), ("result", "结果", 70), ("event_id", "事件ID", 170), ("description", "说明", 280)], rows, 10)
+
+    def filtered_operation_logs(self, limit=None):
+        where = []
+        params = []
+        if self.operation_log_type_filter.get() != "全部":
+            where.append("object_type=?")
+            params.append(self.operation_log_type_filter.get())
+        keyword = self.operation_log_keyword.get().strip()
+        if keyword:
+            where.append("(operator_name LIKE ? OR operation_type LIKE ? OR event_id LIKE ? OR result LIKE ? OR description LIKE ?)")
+            like = f"%{keyword}%"
+            params.extend([like, like, like, like, like])
+        sql = "SELECT * FROM operation_logs"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY id DESC"
+        if limit:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return self.db.query(sql, tuple(params))
+
+    def export_operation_logs(self):
+        if not self.require_action("approve", "导出审计日志"):
+            return
+        self.export_csv("operation_logs", self.filtered_operation_logs())
 
     def selected_user_id(self):
         selection = getattr(self, "user_tree", None).selection() if hasattr(self, "user_tree") else ()
@@ -2709,4 +3481,15 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    try:
+        App().mainloop()
+    except SystemExit:
+        LOGGER.info("application_exit_requested")
+        raise
+    except Exception as exc:
+        LOGGER.exception("application_fatal_error")
+        try:
+            messagebox.showerror("启动失败", f"{exc}\n请查看 data/logs/error.log")
+        except Exception:
+            pass
+        raise

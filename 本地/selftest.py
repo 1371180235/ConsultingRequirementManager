@@ -1,5 +1,7 @@
 import traceback
 import tempfile
+import os
+import sqlite3
 from pathlib import Path
 
 import app
@@ -10,10 +12,79 @@ def assert_true(condition, message):
         raise AssertionError(message)
 
 
+def assert_log_files(logs_dir):
+    app.LOGGER.info("selftest_runtime_marker")
+    app.LOGGER.error("selftest_error_marker")
+    app.audit_event("自测", "logging", None, "selftest", "日志分流检查")
+    for logger in (app.LOGGER, app.AUDIT_LOGGER):
+        for handler in logger.handlers:
+            handler.flush()
+    runtime_path = logs_dir / "runtime.log"
+    error_path = logs_dir / "error.log"
+    audit_path = logs_dir / "audit.log"
+    assert_true(runtime_path.exists() and "selftest_runtime_marker" in runtime_path.read_text(encoding="utf-8"), "运行日志未写入")
+    assert_true(error_path.exists() and "selftest_error_marker" in error_path.read_text(encoding="utf-8"), "错误日志未分流")
+    audit_lines = [line for line in audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert_true(audit_lines and app.json.loads(audit_lines[-1])["operation_type"] == "selftest", "审计日志不是有效 JSON Lines")
+
+
+def assert_critical_error_routing():
+    old_level = os.environ.get("CRM_LOG_LEVEL")
+    with tempfile.TemporaryDirectory(prefix="crm-critical-log-selftest-") as temp_dir:
+        try:
+            os.environ["CRM_LOG_LEVEL"] = "CRITICAL"
+            logs_dir = app.configure_logging(Path(temp_dir), "critical routing selftest")
+            app.LOGGER.error("error_must_not_be_suppressed")
+            for handler in app.LOGGER.handlers:
+                handler.flush()
+            assert_true("error_must_not_be_suppressed" in (logs_dir / "error.log").read_text(encoding="utf-8"),
+                        "CRM_LOG_LEVEL=CRITICAL 时错误日志被错误过滤")
+        finally:
+            app.close_logging()
+            if old_level is None:
+                os.environ.pop("CRM_LOG_LEVEL", None)
+            else:
+                os.environ["CRM_LOG_LEVEL"] = old_level
+
+
+def test_legacy_audit_migration():
+    with tempfile.TemporaryDirectory(prefix="crm-legacy-audit-selftest-") as temp_dir:
+        base_dir = Path(temp_dir) / "application"
+        data_dir = Path(temp_dir) / "data"
+        base_dir.mkdir()
+        data_dir.mkdir()
+        legacy = sqlite3.connect(data_dir / "app.db")
+        legacy.execute("""CREATE TABLE operation_logs (
+                           id INTEGER PRIMARY KEY AUTOINCREMENT,
+                           operator_name TEXT, operation_time TEXT NOT NULL, object_type TEXT NOT NULL,
+                           object_id INTEGER, operation_type TEXT NOT NULL, before_value TEXT,
+                           after_value TEXT, description TEXT)""")
+        legacy.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, operation_type, description)
+                           VALUES('旧用户','2026-01-01 00:00:00','legacy','update','旧版记录')""")
+        legacy.commit()
+        legacy.close()
+        db = None
+        try:
+            db = app.Database(base_dir, data_dir=data_dir)
+            columns = {row[1] for row in db.conn.execute("PRAGMA table_info(operation_logs)")}
+            assert_true({"event_id", "result"}.issubset(columns), "旧版操作日志字段未升级")
+            row = db.one("SELECT event_id, result FROM operation_logs WHERE object_type='legacy'")
+            assert_true(row["event_id"] is None and row["result"] == "legacy", "旧日志被错误标记为成功")
+            index = db.one("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_operation_logs_event_id'")
+            assert_true(index and "UNIQUE INDEX" in index["sql"].upper(), "审计事件 ID 唯一索引未创建")
+        finally:
+            if db is not None:
+                db.close()
+            app.close_logging()
+
+
 def test_database_transactions():
     with tempfile.TemporaryDirectory(prefix="crm-selftest-") as temp_dir:
-        db = app.Database(Path(temp_dir))
+        base_dir = Path(temp_dir) / "application"
+        base_dir.mkdir()
+        db = None
         try:
+            db = app.Database(base_dir, data_dir=Path(temp_dir) / "runtime-data")
             req = db.one("SELECT * FROM requirements WHERE requirement_code='REQ-DEMO-001'")
             before_allocated = float(req["allocated_budget"] or 0)
             db.record_budget_flow("BF-SELFTEST-1", req["project_id"], req["annual_plan_id"], req["version_id"], req["id"],
@@ -66,19 +137,45 @@ def test_database_transactions():
             db.review_change_request(change_id, "approved", "自测审批人", app.now_text())
             changed = db.one("SELECT requirement_name, status FROM requirements WHERE id=?", (req["id"],))
             assert_true(changed["requirement_name"] == "统一需求池（已审批）" and changed["status"] == "变更中", "审批内容未应用")
+            attachment_path = db.attachments_dir / "selftest.txt"
+            attachment_path.write_text("attachment", encoding="utf-8")
+            stored_path = attachment_path.relative_to(db.data_dir)
+            assert_true((db.data_dir / stored_path).read_text(encoding="utf-8") == "attachment", "外部数据目录附件相对路径失败")
+            assert_true(db.healthcheck()["free_bytes"] > 0, "数据库层健康检查失败")
+            assert_log_files(db.logs_dir)
+            audit_ids = {
+                app.json.loads(line)["event_id"]
+                for line in (db.logs_dir / "audit.log").read_text(encoding="utf-8").splitlines() if line.strip()
+            }
+            logged = db.one("SELECT event_id, result FROM operation_logs WHERE event_id IS NOT NULL ORDER BY id DESC LIMIT 1")
+            assert_true(logged and logged["event_id"] in audit_ids and logged["result"] == "success", "数据库与文件审计无法按事件 ID 对账")
         finally:
-            db.conn.close()
+            if db is not None:
+                db.close()
+            app.close_logging()
 
 
-def main():
+def run_checks():
+    test_legacy_audit_migration()
     test_database_transactions()
-    root = app.App()
+    root = None
     try:
+        root = app.App()
         assert_true(root.db.db_path.exists(), "数据库文件未创建")
         assert_true(root.db.attachments_dir.exists(), "附件目录未创建")
         assert_true(root.db.exports_dir.exists(), "导出目录未创建")
         assert_true(root.db.backups_dir.exists(), "备份目录未创建")
+        assert_true(root.db.logs_dir.exists(), "日志目录未创建")
+        for name in ["runtime.log", "error.log", "audit.log"]:
+            assert_true((root.db.logs_dir / name).exists(), f"日志文件未创建：{name}")
         assert_true(root.current_project_id() is not None, "未加载默认项目")
+
+        callback_errors = []
+        root.report_callback_exception = lambda *error: callback_errors.append(error)
+        root.show_dashboard()
+        root.show_projects()
+        root.update_idletasks()
+        root.update()
 
         pages = [
             root.show_dashboard,
@@ -104,6 +201,9 @@ def main():
 
         log_count = root.db.one("SELECT COUNT(*) c FROM operation_logs")["c"]
         assert_true(log_count >= 1, "操作日志未初始化")
+        root.operation_log_type_filter.set("system")
+        assert_true(all(row["object_type"] == "system" for row in root.filtered_operation_logs(limit=20)), "操作日志类型过滤失败")
+        root.operation_log_type_filter.set("全部")
 
         for table in ["requirement_status_history", "version_baselines", "version_baseline_requirements"]:
             exists = root.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
@@ -127,8 +227,40 @@ def main():
             raise AssertionError("无效日期未被拒绝")
         except ValueError:
             pass
+        root.update_idletasks()
+        root.update()
+        for handler in app.LOGGER.handlers:
+            handler.flush()
+        error_text = (root.db.logs_dir / "error.log").read_text(encoding="utf-8")
+        assert_true("bad window path name" not in error_text and "unhandled_tk_callback" not in error_text,
+                    "页面切换后仍存在失效控件回调")
+        assert_true(not callback_errors, f"页面切换触发 Tk 回调异常：{callback_errors}")
     finally:
-        root.destroy()
+        if root is not None:
+            root.on_close()
+        else:
+            app.close_logging()
+
+
+def main():
+    old_data_dir = os.environ.get("CRM_DATA_DIR")
+    old_seed_demo = os.environ.get("CRM_SEED_DEMO_DATA")
+    with tempfile.TemporaryDirectory(prefix="crm-ui-selftest-") as temp_dir:
+        try:
+            os.environ["CRM_DATA_DIR"] = str(Path(temp_dir) / "data")
+            os.environ["CRM_SEED_DEMO_DATA"] = "1"
+            assert_true(len({app.new_event_id() for _ in range(1000)}) == 1000, "审计事件 ID 出现重复")
+            run_checks()
+            assert_critical_error_routing()
+        finally:
+            if old_data_dir is None:
+                os.environ.pop("CRM_DATA_DIR", None)
+            else:
+                os.environ["CRM_DATA_DIR"] = old_data_dir
+            if old_seed_demo is None:
+                os.environ.pop("CRM_SEED_DEMO_DATA", None)
+            else:
+                os.environ["CRM_SEED_DEMO_DATA"] = old_seed_demo
 
 
 if __name__ == "__main__":

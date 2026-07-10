@@ -1,2 +1,2 @@
-mysql-connector-python>=9.0.0
+mysql-connector-python>=9.2.0
 oss2>=2.19.1

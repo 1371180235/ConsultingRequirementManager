@@ -1,10 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
+project_dir = Path(SPECPATH)
+
 
 a = Analysis(
     ['installer.py'],
     pathex=[],
-    binaries=[('E:\\Syw\\work\\ConsultingRequirementManager\\exe\\ConsultingRequirementManager.exe', '.')],
+    binaries=[(str(project_dir / 'dist' / 'ConsultingRequirementManager.exe'), '.')],
     datas=[],
     hiddenimports=[],
     hookspath=[],

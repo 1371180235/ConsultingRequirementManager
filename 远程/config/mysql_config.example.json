@@ -8,6 +8,8 @@
   "create_database": false,
   "seed_demo_data": false,
   "connect_timeout": 10,
+  "read_timeout": 30,
+  "write_timeout": 30,
   "ssl_ca": "",
   "attachment_storage": "server",
   "attachments_dir": "/opt/consulting-requirement-manager/attachments",

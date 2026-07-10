@@ -81,7 +81,7 @@ class Installer(tk.Tk):
             target.mkdir(parents=True, exist_ok=True)
             shutil.copy2(bundled_exe, target / APP_EXE)
             create_launcher(target)
-            for folder in ["data", "data\\attachments", "data\\backups", "data\\exports"]:
+            for folder in ["data", "data\\attachments", "data\\backups", "data\\exports", "data\\logs"]:
                 (target / folder).mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             messagebox.showerror("安装失败", str(exc))

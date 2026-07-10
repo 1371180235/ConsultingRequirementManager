@@ -1,20 +1,27 @@
 import csv
 import json
+import logging
 import math
 import os
 import shutil
 import sqlite3
+import socket
+import subprocess
 import sys
 import tempfile
+import uuid
 import zipfile
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 
 APP_NAME = "咨询项目全流程需求管理系统"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.2"
+APP_VARIANT = "SQLite 本地版"
+HOST_NAME = socket.gethostname()
 STATUS_FLOW = ["草稿", "规划中", "已排期", "研发中", "待验收", "已上线运维", "已关闭"]
 EXTRA_STATUSES = ["已驳回", "已挂起", "已取消", "变更中", "退回修改"]
 ROLES = ["管理员", "咨询负责人", "客户", "销售", "项目经理", "研发人员", "运营人员"]
@@ -72,18 +79,18 @@ ROLE_PANEL_TITLES = {
     "管理员": "管理员全局巡检",
 }
 STATUS_COLORS = {
-    "草稿": "#eef2f7",
-    "规划中": "#e8f1ff",
-    "已排期": "#e9f8f0",
-    "研发中": "#fff5dc",
-    "待验收": "#fff0e6",
-    "已上线运维": "#e8f7f5",
-    "已关闭": "#eceff3",
-    "已驳回": "#ffecec",
-    "已挂起": "#f2efff",
-    "已取消": "#f1f1f1",
-    "变更中": "#fdf0ff",
-    "退回修改": "#fff0f0",
+    "草稿": "#edf1ef",
+    "规划中": "#e6f0f5",
+    "已排期": "#e7f3ed",
+    "研发中": "#fff2d9",
+    "待验收": "#fcebdc",
+    "已上线运维": "#e3f2ef",
+    "已关闭": "#e8edeb",
+    "已驳回": "#fbe7e5",
+    "已挂起": "#eee9f6",
+    "已取消": "#eceeed",
+    "变更中": "#f5e9f2",
+    "退回修改": "#f9e8e7",
 }
 ARTIFACT_STAGE_HINTS = {
     "可研报告": "宏观规划",
@@ -96,6 +103,8 @@ ARTIFACT_STAGE_HINTS = {
     "运维反馈": "运维运营",
     "运营反馈": "运维运营",
 }
+LOGGER = logging.getLogger("consulting_requirement.runtime")
+AUDIT_LOGGER = logging.getLogger("consulting_requirement.audit")
 
 
 def now_text():
@@ -135,15 +144,148 @@ def app_base_dir():
     return Path(__file__).resolve().parent
 
 
+def env_int(name, default, minimum, maximum):
+    try:
+        return min(maximum, max(minimum, int(os.environ.get(name, default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def configure_logging(logs_dir, variant):
+    logs_dir = Path(logs_dir)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    max_bytes = env_int("CRM_LOG_MAX_BYTES", 10 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024)
+    backup_count = env_int("CRM_LOG_BACKUP_COUNT", 30, 1, 365)
+    level_name = os.environ.get("CRM_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    for logger in (LOGGER, AUDIT_LOGGER):
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+            handler.close()
+        logger.propagate = False
+
+    runtime_handler = RotatingFileHandler(logs_dir / "runtime.log", maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+    runtime_handler.setLevel(level)
+    runtime_handler.setFormatter(logging.Formatter(f"%(asctime)s | %(levelname)s | %(process)d | {HOST_NAME} | %(message)s"))
+    error_handler = RotatingFileHandler(logs_dir / "error.log", maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(logging.Formatter(f"%(asctime)s | %(levelname)s | %(process)d | {HOST_NAME} | %(message)s"))
+    # Handler levels control routing. Keep the logger permissive so a CRITICAL
+    # runtime setting cannot suppress ordinary ERROR records in error.log.
+    LOGGER.setLevel(logging.DEBUG)
+    LOGGER.addHandler(runtime_handler)
+    LOGGER.addHandler(error_handler)
+
+    audit_handler = RotatingFileHandler(logs_dir / "audit.log", maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+    audit_handler.setLevel(logging.INFO)
+    audit_handler.setFormatter(logging.Formatter("%(message)s"))
+    AUDIT_LOGGER.setLevel(logging.INFO)
+    AUDIT_LOGGER.addHandler(audit_handler)
+    if os.name != "nt":
+        try:
+            logs_dir.chmod(0o700)
+            for path in [logs_dir / "runtime.log", logs_dir / "error.log", logs_dir / "audit.log"]:
+                path.chmod(0o600)
+        except OSError as exc:
+            LOGGER.warning("log_permission_hardening_failed path=%s reason=%s", logs_dir, exc)
+    LOGGER.info("logging_initialized variant=%s level=%s max_bytes=%s backups=%s", variant, level_name, max_bytes, backup_count)
+    return logs_dir
+
+
+def close_logging():
+    for logger in (LOGGER, AUDIT_LOGGER):
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+            handler.flush()
+            handler.close()
+
+
+def new_event_id():
+    return uuid.uuid4().hex
+
+
+def audit_event(operator, object_type, object_id, operation_type, description, result="success", event_id=None):
+    event_id = event_id or new_event_id()
+    payload = {
+        "timestamp": now_text(),
+        "event_id": event_id,
+        "host": HOST_NAME,
+        "process_id": os.getpid(),
+        "app_version": APP_VERSION,
+        "variant": APP_VARIANT,
+        "operator": str(operator or ""),
+        "object_type": str(object_type or ""),
+        "object_id": object_id,
+        "operation_type": str(operation_type or ""),
+        "description": str(description or ""),
+        "result": result,
+    }
+    AUDIT_LOGGER.info(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    return event_id
+
+
+def sql_summary(sql):
+    return " ".join(str(sql).split())[:160]
+
+
+def log_transaction_exception(name, exc):
+    if isinstance(exc, ValueError):
+        LOGGER.warning("transaction_rejected name=%s reason=%s", name, exc)
+    else:
+        LOGGER.error("transaction_failed name=%s", name, exc_info=True)
+
+
+def verify_directory_writable(folder):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix="crm-health-", dir=folder, delete=False) as handle:
+        path = Path(handle.name)
+        handle.write(b"healthcheck")
+    path.unlink()
+
+
+def validate_restore_archive(archive, required_names=(), required_prefix=None):
+    configured_limit = env_int("CRM_RESTORE_MAX_BYTES", 20 * 1024**3, 1024**2, 1024**4)
+    free_limit = max(0, shutil.disk_usage(tempfile.gettempdir()).free // 2)
+    limit = min(configured_limit, free_limit)
+    total_size = 0
+    names = []
+    for info in archive.infolist():
+        name = info.filename
+        path = Path(name)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("备份包含不安全路径。")
+        if (info.external_attr >> 16) & 0o170000 == 0o120000:
+            raise ValueError("备份包含不允许恢复的符号链接。")
+        total_size += info.file_size
+        if total_size > limit:
+            raise ValueError(f"备份解压后大小超过恢复上限：{limit} 字节。")
+        if info.file_size > 10 * 1024**2 and (info.compress_size == 0 or info.file_size / info.compress_size > 200):
+            raise ValueError("备份包含异常压缩比文件，已拒绝恢复。")
+        names.append(name)
+    if any(name not in names for name in required_names):
+        raise ValueError("备份缺少必要文件。")
+    if required_prefix and not any(name.startswith(required_prefix) for name in names):
+        raise ValueError(f"备份中没有 {required_prefix} 目录。")
+    return names
+
+
 class Database:
-    def __init__(self, base_dir: Path):
+    def __init__(self, base_dir: Path, data_dir=None):
         self.base_dir = base_dir
-        self.data_dir = base_dir / "data"
+        configured_data_dir = data_dir or os.environ.get("CRM_DATA_DIR", "")
+        self.data_dir = Path(configured_data_dir).expanduser().resolve() if configured_data_dir else base_dir / "data"
+        if self.data_dir.resolve() == Path(self.data_dir.resolve().anchor):
+            raise RuntimeError("CRM_DATA_DIR 不能配置为磁盘根目录。")
         self.attachments_dir = self.data_dir / "attachments"
         self.backups_dir = self.data_dir / "backups"
         self.exports_dir = self.data_dir / "exports"
-        for folder in [self.data_dir, self.attachments_dir, self.backups_dir, self.exports_dir]:
+        self.logs_dir = self.data_dir / "logs"
+        for folder in [self.data_dir, self.attachments_dir, self.backups_dir, self.exports_dir, self.logs_dir]:
             folder.mkdir(parents=True, exist_ok=True)
+        configure_logging(self.logs_dir, "SQLite local")
+        LOGGER.info("database_initializing engine=sqlite path=%s", self.data_dir / "app.db")
         self.db_path = self.data_dir / "app.db"
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
@@ -151,9 +293,14 @@ class Database:
         self.seed_defaults()
 
     def execute(self, sql, params=()):
-        cur = self.conn.execute(sql, params)
-        self.conn.commit()
-        return cur
+        try:
+            cur = self.conn.execute(sql, params)
+            self.conn.commit()
+            return cur
+        except Exception:
+            self.conn.rollback()
+            LOGGER.exception("sqlite_execute_failed sql=%s", sql_summary(sql))
+            raise
 
     def record_budget_flow(self, flow_code, project_id, annual_plan_id, version_id, requirement_id,
                            flow_type, amount, description, operator_name, occurred_at, allow_actual_overrun=False):
@@ -198,9 +345,17 @@ class Database:
             elif req and flow_type == "实际消耗":
                 self.conn.execute("UPDATE requirements SET actual_cost=actual_cost+?, updated_at=? WHERE id=?",
                                   (amount, occurred_at, requirement_id))
+            event_id = new_event_id()
+            self.conn.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                              operation_type, before_value, after_value, description,
+                                                              event_id, result)
+                                 VALUES(?,?,'budget_flow',?,'create','',?,?,?,'success')""",
+                              (operator_name, occurred_at, requirement_id, flow_code, f"登记资金流水：{flow_type}", event_id))
             self.conn.commit()
-        except Exception:
+            audit_event(operator_name, "budget_flow", requirement_id, "create", f"登记资金流水：{flow_type}", event_id=event_id)
+        except Exception as exc:
             self.conn.rollback()
+            log_transaction_exception("record_budget_flow", exc)
             raise
 
     def freeze_version_with_baseline(self, version_id, operator_name, occurred_at):
@@ -235,15 +390,19 @@ class Database:
                                        WHERE id=? AND is_frozen=0""", (occurred_at, version_id))
             if cur.rowcount != 1:
                 raise ValueError("版本冻结状态已被其他操作更新，请刷新后重试。")
+            event_id = new_event_id()
             self.conn.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
-                                                              operation_type, before_value, after_value, description)
-                                 VALUES(?,?,?,?,?,?,?,?)""",
+                                                              operation_type, before_value, after_value, description,
+                                                              event_id, result)
+                                 VALUES(?,?,?,?,?,?,?,?,?,'success')""",
                               (operator_name, occurred_at, "implementation_version", version_id, "freeze", "",
-                               f"baseline:{baseline_id}", f"冻结版本并生成基线 #{snapshot_no}"))
+                               f"baseline:{baseline_id}", f"冻结版本并生成基线 #{snapshot_no}", event_id))
             self.conn.commit()
+            audit_event(operator_name, "implementation_version", version_id, "freeze", f"冻结版本并生成基线 #{snapshot_no}", event_id=event_id)
             return {"baseline_id": baseline_id, "snapshot_no": snapshot_no}
-        except Exception:
+        except Exception as exc:
             self.conn.rollback()
+            log_transaction_exception("freeze_version", exc)
             raise
 
     def review_change_request(self, change_id, status, operator_name, occurred_at):
@@ -294,15 +453,19 @@ class Database:
                                     (status, operator_name, occurred_at, change_id))
             if cur.rowcount != 1:
                 raise ValueError("该变更申请已被其他操作处理，请刷新后重试。")
+            event_id = new_event_id()
             self.conn.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
-                                                              operation_type, before_value, after_value, description)
-                                 VALUES(?,?,?,?,?,?,?,?)""",
+                                                              operation_type, before_value, after_value, description,
+                                                              event_id, result)
+                                 VALUES(?,?,?,?,?,?,?,?,?,'success')""",
                               (operator_name, occurred_at, "change_request", change_id, status, str(dict(change)), status,
-                               "变更申请通过" if status == "approved" else "变更申请驳回"))
+                               "变更申请通过" if status == "approved" else "变更申请驳回", event_id))
             self.conn.commit()
+            audit_event(operator_name, "change_request", change_id, status, "变更申请通过" if status == "approved" else "变更申请驳回", event_id=event_id)
             return change
-        except Exception:
+        except Exception as exc:
             self.conn.rollback()
+            log_transaction_exception("review_change_request", exc)
             raise
 
     def transition_requirement_status(self, requirement_id, from_status, to_status, note, operator_name, occurred_at):
@@ -327,21 +490,63 @@ class Database:
                                                                           operator_name, transition_note, changed_at)
                                  VALUES(?,?,?,?,?,?)""",
                               (requirement_id, from_status, to_status, operator_name, note, occurred_at))
+            event_id = new_event_id()
             self.conn.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
-                                                              operation_type, before_value, after_value, description)
-                                 VALUES(?,?,'requirement',?,'status_change',?,?,?)""",
-                              (operator_name, occurred_at, requirement_id, from_status, to_status, f"需求状态流转：{note}"))
+                                                              operation_type, before_value, after_value, description,
+                                                              event_id, result)
+                                 VALUES(?,?,'requirement',?,'status_change',?,?,?,?, 'success')""",
+                              (operator_name, occurred_at, requirement_id, from_status, to_status, f"需求状态流转：{note}", event_id))
             self.conn.commit()
+            audit_event(operator_name, "requirement", requirement_id, "status_change", f"{from_status} -> {to_status}", event_id=event_id)
             return True
-        except Exception:
+        except Exception as exc:
             self.conn.rollback()
+            log_transaction_exception("transition_requirement_status", exc)
             raise
 
     def query(self, sql, params=()):
-        return self.conn.execute(sql, params).fetchall()
+        try:
+            return self.conn.execute(sql, params).fetchall()
+        except Exception:
+            LOGGER.exception("sqlite_query_failed sql=%s", sql_summary(sql))
+            raise
 
     def one(self, sql, params=()):
-        return self.conn.execute(sql, params).fetchone()
+        try:
+            return self.conn.execute(sql, params).fetchone()
+        except Exception:
+            LOGGER.exception("sqlite_query_one_failed sql=%s", sql_summary(sql))
+            raise
+
+    def close(self):
+        try:
+            self.conn.close()
+            LOGGER.info("database_connection_closed engine=sqlite")
+        except Exception:
+            LOGGER.exception("database_close_failed engine=sqlite")
+
+    def healthcheck(self):
+        integrity = self.conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise RuntimeError(f"SQLite integrity_check failed: {integrity}")
+        required_tables = {
+            "planning_projects", "annual_plans", "implementation_versions", "requirements",
+            "budget_flows", "artifacts", "operation_logs", "version_baselines",
+        }
+        existing = {row[0] for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        missing = sorted(required_tables - existing)
+        if missing:
+            raise RuntimeError(f"缺少数据表：{', '.join(missing)}")
+        log_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(operation_logs)")}
+        if not {"event_id", "result"}.issubset(log_columns):
+            raise RuntimeError("operation_logs 缺少 event_id/result 审计字段。")
+        for folder in [self.data_dir, self.attachments_dir, self.backups_dir, self.exports_dir, self.logs_dir]:
+            verify_directory_writable(folder)
+        minimum_free = env_int("CRM_MIN_FREE_BYTES", 512 * 1024 * 1024, 0, 10 * 1024 * 1024 * 1024 * 1024)
+        free_bytes = shutil.disk_usage(self.data_dir).free
+        if free_bytes < minimum_free:
+            raise RuntimeError(f"磁盘剩余空间低于阈值：{free_bytes} < {minimum_free}")
+        return {"database": str(self.db_path), "data_dir": str(self.data_dir), "free_bytes": free_bytes}
 
     def init_schema(self):
         schema = """
@@ -460,7 +665,9 @@ class Database:
             operation_type TEXT NOT NULL,
             before_value TEXT,
             after_value TEXT,
-            description TEXT
+            description TEXT,
+            event_id TEXT,
+            result TEXT DEFAULT 'success'
         );
         CREATE TABLE IF NOT EXISTS change_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -515,15 +722,28 @@ class Database:
         );
         """
         self.conn.executescript(schema)
+        operation_log_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(operation_logs)")}
+        if "event_id" not in operation_log_columns:
+            self.conn.execute("ALTER TABLE operation_logs ADD COLUMN event_id TEXT")
+        if "result" not in operation_log_columns:
+            self.conn.execute("ALTER TABLE operation_logs ADD COLUMN result TEXT DEFAULT 'legacy'")
+        self.conn.execute("UPDATE operation_logs SET result='legacy' WHERE event_id IS NULL")
+        log_indexes = {row[1]: row[2] for row in self.conn.execute("PRAGMA index_list(operation_logs)")}
+        if log_indexes.get("idx_operation_logs_event_id") != 1:
+            self.conn.execute("DROP INDEX IF EXISTS idx_operation_logs_event_id")
+            self.conn.execute("CREATE UNIQUE INDEX idx_operation_logs_event_id ON operation_logs(event_id) WHERE event_id IS NOT NULL")
         self.conn.commit()
 
     def seed_defaults(self):
+        initialized = []
         if not self.one("SELECT id FROM users WHERE username='admin'"):
             self.execute(
                 "INSERT INTO users(username, display_name, password_hash, role_name, created_at, updated_at) VALUES(?,?,?,?,?,?)",
                 ("admin", "默认管理员", "", "管理员", now_text(), now_text()),
             )
-        if not self.one("SELECT id FROM planning_projects"):
+            initialized.append("默认管理员")
+        seed_demo_data = os.environ.get("CRM_SEED_DEMO_DATA", "0").strip().lower() in {"1", "true", "yes", "on"}
+        if seed_demo_data and not self.one("SELECT id FROM planning_projects"):
             t = now_text()
             self.execute(
                 "INSERT INTO planning_projects(project_code, project_name, customer_name, project_background, total_budget, created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
@@ -547,19 +767,25 @@ class Database:
                 ("REQ-DEMO-001", "建立统一需求池", "将客户、销售、研发、运营等来源的需求统一登记并跟踪状态。", "咨询负责人", "咨询负责人", "默认管理员",
                  project_id, plan_id, version_id, "功能优化", "版本必做,待确认", "P0", "规划中", 80000, 60000, 12000, t, t),
             )
+            initialized.append("演示业务数据")
         if not self.one("SELECT id FROM requirement_status_history LIMIT 1"):
             for row in self.query("SELECT id, status, created_at FROM requirements WHERE is_deleted=0"):
                 self.execute(
                     "INSERT INTO requirement_status_history(requirement_id, from_status, to_status, operator_name, transition_note, changed_at) VALUES(?,?,?,?,?,?)",
                     (row["id"], "", row["status"], "系统", "初始化需求状态历史", row["created_at"]),
                 )
-        self.log("系统", "system", None, "init", "", "", "初始化数据库和默认数据")
+            initialized.append("需求状态历史")
+        if initialized:
+            self.log("系统", "system", None, "init", "", "", "初始化：" + "、".join(initialized))
 
-    def log(self, operator, object_type, object_id, operation_type, before_value, after_value, description):
+    def log(self, operator, object_type, object_id, operation_type, before_value, after_value, description, result="success"):
+        event_id = new_event_id()
         self.execute(
-            "INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id, operation_type, before_value, after_value, description) VALUES(?,?,?,?,?,?,?,?)",
-            (operator, now_text(), object_type, object_id, operation_type, str(before_value or ""), str(after_value or ""), description),
+            "INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id, operation_type, before_value, after_value, description, event_id, result) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (operator, now_text(), object_type, object_id, operation_type, str(before_value or ""), str(after_value or ""), description, event_id, result),
         )
+        audit_event(operator, object_type, object_id, operation_type, description, result=result, event_id=event_id)
+        return event_id
 
 
 class DetailDialog(tk.Toplevel):
@@ -568,9 +794,12 @@ class DetailDialog(tk.Toplevel):
         self.title(title)
         self.geometry("760x560")
         self.minsize(640, 420)
+        colors = getattr(parent, "colors", {"surface": "#ffffff", "text": "#1e2927", "primary": "#176b87"})
+        self.configure(background=colors["surface"])
         body = ttk.Frame(self, padding=16, style="Surface.TFrame")
         body.pack(fill=tk.BOTH, expand=True)
-        text = tk.Text(body, wrap=tk.WORD, relief=tk.FLAT, padx=12, pady=12, bg="#ffffff", fg="#172033")
+        text = tk.Text(body, wrap=tk.WORD, relief=tk.FLAT, padx=12, pady=12,
+                       bg=colors["surface"], fg=colors["text"], selectbackground="#cfe2e1")
         ybar = ttk.Scrollbar(body, orient=tk.VERTICAL, command=text.yview)
         text.configure(yscrollcommand=ybar.set)
         text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -580,7 +809,7 @@ class DetailDialog(tk.Toplevel):
             for label, value in rows:
                 text.insert(tk.END, f"  {label}: {value or ''}\n")
             text.insert(tk.END, "\n")
-        text.tag_configure("h", font=("Microsoft YaHei UI", 12, "bold"), foreground="#2563eb")
+        text.tag_configure("h", font=("Microsoft YaHei UI", 12, "bold"), foreground=colors["primary"])
         text.configure(state=tk.DISABLED)
         ttk.Button(self, text="关闭", command=self.destroy).pack(pady=(0, 12))
         self.transient(parent)
@@ -598,9 +827,11 @@ class FieldDialog(tk.Toplevel):
         self.vars = {}
         self.required = set(required or [])
         initial = initial or {}
+        colors = getattr(parent, "colors", {"surface": "#ffffff", "text": "#1e2927", "line": "#d5ddda"})
+        self.configure(background=colors["surface"])
         container = ttk.Frame(self, style="Surface.TFrame")
         container.pack(fill=tk.BOTH, expand=True)
-        canvas = tk.Canvas(container, bg="#ffffff", highlightthickness=0, width=620,
+        canvas = tk.Canvas(container, bg=colors["surface"], highlightthickness=0, width=620,
                            height=min(620, max(300, len(fields) * 48 + 90)))
         scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
@@ -627,7 +858,9 @@ class FieldDialog(tk.Toplevel):
                 widget = ttk.Entry(body, textvariable=var, width=42, state="readonly")
             else:
                 var = tk.StringVar(value=value)
-                widget = tk.Text(body, width=42, height=5)
+                widget = tk.Text(body, width=42, height=5, bg="#fbfcfc", fg=colors["text"],
+                                 insertbackground=colors["text"], highlightthickness=1,
+                                 highlightbackground=colors["line"], highlightcolor="#3d7480", relief=tk.FLAT)
                 widget.insert("1.0", value)
             widget.grid(row=row, column=1, sticky="ew", pady=5)
             self.vars[key] = (var, widget, kind)
@@ -678,79 +911,140 @@ class App(tk.Tk):
         self.requirement_scope = tk.StringVar(value="当前版本")
         self.requirement_status_filter = tk.StringVar(value="全部状态")
         self.change_status_filter = tk.StringVar(value="全部")
+        self.operation_log_type_filter = tk.StringVar(value="全部")
+        self.operation_log_keyword = tk.StringVar()
         self.content = None
         self.current_page = "首页工作台"
         self.configure_style()
         self.build_layout()
         self.refresh_contexts()
         self.show_dashboard()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        LOGGER.info("application_started version=%s variant=sqlite user=%s", APP_VERSION, self.current_user)
+
+    def report_callback_exception(self, exc_type, exc_value, exc_traceback):
+        LOGGER.error("unhandled_tk_callback", exc_info=(exc_type, exc_value, exc_traceback))
+        messagebox.showerror("系统错误", f"操作执行失败：{exc_value}\n详细信息已写入：{self.db.logs_dir / 'error.log'}")
+
+    def open_logs_directory(self):
+        try:
+            if os.name == "nt":
+                os.startfile(str(self.db.logs_dir))
+            else:
+                subprocess.Popen(["xdg-open", str(self.db.logs_dir)])
+        except Exception as exc:
+            LOGGER.exception("open_logs_directory_failed path=%s", self.db.logs_dir)
+            messagebox.showerror("打开失败", str(exc))
+
+    def run_healthcheck(self):
+        try:
+            details = self.db.healthcheck()
+            self.db.log(self.current_user, "healthcheck", None, "check", "", "success", "本地版部署健康检查通过")
+            LOGGER.info("healthcheck_succeeded variant=sqlite")
+            messagebox.showinfo("健康检查通过", json.dumps(details, ensure_ascii=False, indent=2))
+        except Exception as exc:
+            LOGGER.exception("healthcheck_failed variant=sqlite")
+            try:
+                self.db.log(self.current_user, "healthcheck", None, "check", "", "failed",
+                            "本地版部署健康检查失败", result="failed")
+            except Exception:
+                audit_event(self.current_user, "healthcheck", None, "check", "本地版部署健康检查失败", result="failed")
+            messagebox.showerror("健康检查失败", f"{exc}\n请查看 {self.db.logs_dir / 'error.log'}")
+
+    def on_close(self):
+        LOGGER.info("application_stopping user=%s", self.current_user)
+        self.db.close()
+        LOGGER.info("application_stopped")
+        close_logging()
+        self.destroy()
 
     def configure_style(self):
         style = ttk.Style(self)
         if "clam" in style.theme_names():
             style.theme_use("clam")
         self.colors = {
-            "bg": "#f4f6f8",
+            "bg": "#f2f5f3",
             "surface": "#ffffff",
-            "side": "#1f2937",
-            "side_active": "#334155",
-            "text": "#172033",
-            "muted": "#64748b",
-            "line": "#d9e1ea",
-            "primary": "#2563eb",
-            "success": "#059669",
-            "warning": "#d97706",
-            "danger": "#dc2626",
+            "surface_alt": "#f7f9f8",
+            "side": "#24312f",
+            "side_hover": "#30443f",
+            "side_active": "#557f72",
+            "text": "#1e2927",
+            "muted": "#60706b",
+            "line": "#d5ddda",
+            "primary": "#176b87",
+            "primary_active": "#12566c",
+            "success": "#287a4b",
+            "warning": "#9a5a00",
+            "danger": "#b74643",
         }
+        self.configure(background=self.colors["bg"])
         font = ("Microsoft YaHei UI", 10)
-        style.configure(".", font=font)
+        style.configure(".", font=font, foreground=self.colors["text"])
         style.configure("TFrame", background=self.colors["bg"])
         style.configure("Surface.TFrame", background=self.colors["surface"])
+        style.configure("Topbar.TFrame", background=self.colors["surface"])
+        style.configure("Statusbar.TFrame", background="#e8eeeb")
         style.configure("Side.TFrame", background=self.colors["side"])
-        style.configure("Side.TButton", background=self.colors["side"], foreground="#ffffff", anchor="w", padding=(16, 11), borderwidth=0)
-        style.map("Side.TButton", background=[("active", self.colors["side_active"])])
-        style.configure("SideActive.TButton", background=self.colors["side_active"], foreground="#ffffff", anchor="w", padding=(16, 11), borderwidth=0)
+        style.configure("Side.TButton", background=self.colors["side"], foreground="#eaf0ee", anchor="w", padding=(16, 10), borderwidth=0)
+        style.map("Side.TButton", background=[("active", self.colors["side_hover"])], foreground=[("active", "#ffffff")])
+        style.configure("SideActive.TButton", background=self.colors["side_active"], foreground="#ffffff", anchor="w", padding=(16, 10), borderwidth=0)
         style.map("SideActive.TButton", background=[("active", self.colors["side_active"])])
-        style.configure("TButton", padding=(12, 7))
-        style.configure("Primary.TButton", background=self.colors["primary"], foreground="#ffffff", padding=(12, 7))
-        style.map("Primary.TButton", background=[("active", "#1d4ed8")])
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 16, "bold"), background=self.colors["bg"], foreground=self.colors["text"])
+        style.configure("TButton", background=self.colors["surface"], foreground=self.colors["text"], padding=(11, 7), borderwidth=1, relief="solid")
+        style.map("TButton", background=[("active", "#eaf0ed")], bordercolor=[("focus", self.colors["primary"])])
+        style.configure("Primary.TButton", background=self.colors["primary"], foreground="#ffffff", padding=(12, 7), borderwidth=0)
+        style.map("Primary.TButton", background=[("active", self.colors["primary_active"]), ("disabled", "#9eaaa7")], foreground=[("disabled", "#edf1ef")])
+        style.configure("TEntry", fieldbackground=self.colors["surface"], foreground=self.colors["text"], bordercolor=self.colors["line"], padding=5)
+        style.map("TEntry", bordercolor=[("focus", "#3d7480")])
+        style.configure("TCombobox", fieldbackground=self.colors["surface"], foreground=self.colors["text"], bordercolor=self.colors["line"], padding=4)
+        style.map("TCombobox", bordercolor=[("focus", "#3d7480")], fieldbackground=[("readonly", self.colors["surface"])])
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 15, "bold"), background=self.colors["bg"], foreground=self.colors["text"])
         style.configure("SubTitle.TLabel", font=("Microsoft YaHei UI", 10), background=self.colors["bg"], foreground=self.colors["muted"])
         style.configure("Surface.TLabel", background=self.colors["surface"], foreground=self.colors["text"])
         style.configure("Muted.TLabel", background=self.colors["surface"], foreground=self.colors["muted"])
-        style.configure("Metric.TLabel", font=("Microsoft YaHei UI", 20, "bold"), background=self.colors["surface"], foreground=self.colors["text"])
-        style.configure("Card.TFrame", background=self.colors["surface"], relief="solid", borderwidth=1)
-        style.configure("Treeview", rowheight=30, fieldbackground=self.colors["surface"], background=self.colors["surface"], foreground=self.colors["text"])
-        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 10, "bold"), background="#eef2f7", foreground=self.colors["text"], padding=(6, 7))
+        style.configure("RoleBanner.TLabel", background="#e3efec", foreground="#315f56", padding=(10, 8))
+        style.configure("Status.TLabel", background="#e8eeeb", foreground="#4f625d")
+        style.configure("Metric.TLabel", font=("Microsoft YaHei UI", 19, "bold"), background=self.colors["surface"], foreground=self.colors["text"])
+        style.configure("Card.TFrame", background=self.colors["surface"], relief="solid", borderwidth=1,
+                        bordercolor=self.colors["line"], lightcolor=self.colors["line"], darkcolor=self.colors["line"])
+        style.configure("Treeview", rowheight=31, fieldbackground=self.colors["surface"], background=self.colors["surface"], foreground=self.colors["text"], bordercolor=self.colors["line"])
+        style.map("Treeview", background=[("selected", self.colors["side_active"])], foreground=[("selected", "#ffffff")])
+        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 10, "bold"), background="#e6ece9", foreground="#30413d", padding=(7, 8), relief="flat")
+        style.map("Treeview.Heading", background=[("active", "#dce5e1")])
 
     def build_layout(self):
-        top = ttk.Frame(self, padding=(14, 10), style="Surface.TFrame")
+        top = ttk.Frame(self, padding=(14, 11), style="Topbar.TFrame")
         top.pack(fill=tk.X)
         ttk.Label(top, text="项目", style="Surface.TLabel").pack(side=tk.LEFT)
-        self.project_box = ttk.Combobox(top, textvariable=self.selected_project, state="readonly", width=24)
-        self.project_box.pack(side=tk.LEFT, padx=(6, 12))
+        self.project_box = ttk.Combobox(top, textvariable=self.selected_project, state="readonly", width=22)
+        self.project_box.pack(side=tk.LEFT, padx=(6, 10))
         self.project_box.bind("<<ComboboxSelected>>", lambda e: self.on_project_change())
         ttk.Label(top, text="年度", style="Surface.TLabel").pack(side=tk.LEFT)
-        self.plan_box = ttk.Combobox(top, textvariable=self.selected_plan, state="readonly", width=20)
-        self.plan_box.pack(side=tk.LEFT, padx=(6, 12))
+        self.plan_box = ttk.Combobox(top, textvariable=self.selected_plan, state="readonly", width=18)
+        self.plan_box.pack(side=tk.LEFT, padx=(6, 10))
         self.plan_box.bind("<<ComboboxSelected>>", lambda e: self.on_plan_change())
         ttk.Label(top, text="版本", style="Surface.TLabel").pack(side=tk.LEFT)
-        self.version_box = ttk.Combobox(top, textvariable=self.selected_version, state="readonly", width=20)
-        self.version_box.pack(side=tk.LEFT, padx=(6, 12))
+        self.version_box = ttk.Combobox(top, textvariable=self.selected_version, state="readonly", width=18)
+        self.version_box.pack(side=tk.LEFT, padx=(6, 10))
         self.version_box.bind("<<ComboboxSelected>>", lambda e: self.reload_page())
-        ttk.Entry(top, textvariable=self.search_var, width=28).pack(side=tk.LEFT, padx=(8, 4))
-        ttk.Button(top, text="搜索", command=self.show_search, style="Primary.TButton").pack(side=tk.LEFT)
-        ttk.Label(top, text="角色", style="Surface.TLabel").pack(side=tk.RIGHT, padx=(12, 4))
+        ttk.Entry(top, textvariable=self.search_var, width=20).pack(side=tk.LEFT, padx=(6, 5))
+        ttk.Button(top, text="搜索", command=self.show_search, style="Primary.TButton", width=8).pack(side=tk.LEFT)
         role_box = ttk.Combobox(top, textvariable=self.current_role, values=ROLES, state="readonly", width=12)
         role_box.pack(side=tk.RIGHT)
+        ttk.Label(top, text="角色", style="Surface.TLabel").pack(side=tk.RIGHT, padx=(12, 5))
         role_box.bind("<<ComboboxSelected>>", lambda e: self.reload_page())
+        ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
         main = ttk.Frame(self)
         main.pack(fill=tk.BOTH, expand=True)
-        side = ttk.Frame(main, style="Side.TFrame", width=180)
+        side = ttk.Frame(main, style="Side.TFrame", width=196)
         side.pack(side=tk.LEFT, fill=tk.Y)
         side.pack_propagate(False)
-        ttk.Label(side, text=APP_NAME, background="#243142", foreground="#ffffff", font=("Microsoft YaHei UI", 11, "bold"), wraplength=150).pack(anchor="w", padx=14, pady=(16, 18))
+        brand = tk.Frame(side, bg=self.colors["side"], height=78)
+        brand.pack(fill=tk.X)
+        brand.pack_propagate(False)
+        tk.Label(brand, text="咨询项目全流程\n需求管理系统", bg=self.colors["side"], fg="#ffffff",
+                 font=("Microsoft YaHei UI", 11, "bold"), justify=tk.LEFT, anchor="w").pack(fill=tk.BOTH, padx=16, pady=(15, 12))
         self.nav_buttons = {}
         for name, cmd in [
             ("首页工作台", self.show_dashboard), ("项目管理", self.show_projects), ("年度计划", self.show_plans),
@@ -759,7 +1053,7 @@ class App(tk.Tk):
             ("系统设置", self.show_settings),
         ]:
             button = ttk.Button(side, text=name, style="Side.TButton", command=cmd)
-            button.pack(fill=tk.X, padx=8, pady=2)
+            button.pack(fill=tk.X, padx=9, pady=2)
             self.nav_buttons[name] = button
         right = ttk.Frame(main)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -768,15 +1062,15 @@ class App(tk.Tk):
         self.content_canvas.configure(yscrollcommand=self.content_scrollbar.set)
         self.content_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.content_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.content = ttk.Frame(self.content_canvas, padding=16)
+        self.content = ttk.Frame(self.content_canvas, padding=(18, 16))
         self.content_window = self.content_canvas.create_window((0, 0), window=self.content, anchor="nw")
         self.content.bind("<Configure>", self.on_content_configure)
         self.content_canvas.bind("<Configure>", self.on_canvas_configure)
-        self.content_canvas.bind_all("<MouseWheel>", self.on_mousewheel)
-        bottom = ttk.Frame(self, padding=(10, 5))
+        self.bind("<MouseWheel>", self.on_mousewheel, add="+")
+        bottom = ttk.Frame(self, padding=(12, 6), style="Statusbar.TFrame")
         bottom.pack(fill=tk.X)
-        ttk.Label(bottom, text=f"数据库: {self.db.db_path}").pack(side=tk.LEFT)
-        ttk.Label(bottom, text=f"版本: {APP_VERSION} · SQLite 本地版").pack(side=tk.RIGHT)
+        ttk.Label(bottom, text=f"数据库: {self.db.db_path}", style="Status.TLabel").pack(side=tk.LEFT)
+        ttk.Label(bottom, text=f"版本: {APP_VERSION} · SQLite 本地版", style="Status.TLabel").pack(side=tk.RIGHT)
 
     def on_content_configure(self, _event=None):
         self.content_canvas.configure(scrollregion=self.content_canvas.bbox("all"))
@@ -785,8 +1079,19 @@ class App(tk.Tk):
         self.content_canvas.itemconfigure(self.content_window, width=event.width)
 
     def on_mousewheel(self, event):
-        if self.content_canvas.winfo_exists():
-            self.content_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        try:
+            if event.widget.winfo_toplevel() is not self:
+                return None
+            if isinstance(event.widget, ttk.Treeview):
+                first, last = event.widget.yview()
+                if first > 0 or last < 1:
+                    event.widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                    return "break"
+            if self.content_canvas.winfo_exists():
+                self.content_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                return "break"
+        except tk.TclError:
+            return None
 
     def clear(self, title):
         for child in self.content.winfo_children():
@@ -804,6 +1109,7 @@ class App(tk.Tk):
         right.pack(side=tk.RIGHT)
         ttk.Label(right, text=f"当前角色：{self.current_role.get()}", style="SubTitle.TLabel").pack(anchor="e")
         ttk.Label(right, text=datetime.now().strftime("%Y-%m-%d %H:%M"), style="SubTitle.TLabel").pack(anchor="e", pady=(3, 0))
+        ttk.Separator(self.content, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 12))
 
     def update_nav_state(self):
         for name, button in getattr(self, "nav_buttons", {}).items():
@@ -826,10 +1132,10 @@ class App(tk.Tk):
 
     def notice_banner(self, parent, text, tone="info"):
         palette = {
-            "info": ("#e8f1ff", "#1d4ed8"),
-            "success": ("#e9f8f0", "#047857"),
-            "warning": ("#fff5dc", "#b45309"),
-            "danger": ("#ffecec", "#b91c1c"),
+            "info": ("#e5f0f4", "#176b87"),
+            "success": ("#e4f1e9", "#287a4b"),
+            "warning": ("#fff1d8", "#9a5a00"),
+            "danger": ("#f9e7e5", "#a33d39"),
         }
         background, foreground = palette.get(tone, palette["info"])
         frame = tk.Frame(parent, bg=background, highlightbackground=foreground, highlightthickness=1, padx=12, pady=9)
@@ -852,6 +1158,13 @@ class App(tk.Tk):
     def require_action(self, action, label):
         if self.can_action(action):
             return True
+        description = f"{self.current_role.get()} 无权执行：{label}"
+        try:
+            self.db.log(self.current_user, "permission", None, "denied", "", action, description, result="denied")
+        except Exception:
+            LOGGER.exception("central_permission_audit_failed action=%s", action)
+            audit_event(self.current_user, "permission", None, "denied", description, result="denied")
+        LOGGER.warning("permission_denied role=%s action=%s label=%s", self.current_role.get(), action, label)
         messagebox.showwarning("权限不足", f"当前角色“{self.current_role.get()}”无权执行：{label}")
         return False
 
@@ -946,15 +1259,18 @@ class App(tk.Tk):
     def add_table(self, parent, columns, rows, height=16, on_double_click=None):
         frame = ttk.Frame(parent, style="Surface.TFrame", padding=1)
         frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-        tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show="headings", height=height)
+        visible_rows = min(height, max(2, len(rows)))
+        tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show="headings", height=visible_rows)
         ybar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
         xbar = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=tree.xview)
         tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
         for key, label, width in columns:
             tree.heading(key, text=label, command=lambda col=key: self.sort_treeview(tree, col, False))
             tree.column(key, width=width, anchor="w")
-        tree.tag_configure("odd", background="#ffffff")
-        tree.tag_configure("even", background="#f8fafc")
+        tree.tag_configure("odd", background=self.colors["surface"])
+        tree.tag_configure("even", background=self.colors["surface_alt"])
         for status, color in STATUS_COLORS.items():
             tree.tag_configure(f"status_{status}", background=color)
         for index, row in enumerate(rows):
@@ -963,9 +1279,29 @@ class App(tk.Tk):
             if status in STATUS_COLORS:
                 tags.append(f"status_{status}")
             tree.insert("", tk.END, values=[self.row_value(row, c[0]) for c in columns], tags=tuple(tags))
-        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ybar.pack(side=tk.RIGHT, fill=tk.Y)
-        xbar.pack(side=tk.BOTTOM, fill=tk.X)
+        tree.grid(row=0, column=0, sticky="nsew")
+        if len(rows) > visible_rows:
+            ybar.grid(row=0, column=1, sticky="ns")
+
+        def sync_horizontal_scrollbar(_event=None):
+            try:
+                if not frame.winfo_exists() or not tree.winfo_exists():
+                    return
+                required_width = sum(int(tree.column(column[0], "width")) for column in columns)
+                available = frame.winfo_width() - (ybar.winfo_reqwidth() if len(rows) > visible_rows else 0)
+                if available > 1 and required_width > available:
+                    xbar.grid(row=1, column=0, sticky="ew")
+                else:
+                    xbar.grid_remove()
+                    tree.xview_moveto(0)
+            except tk.TclError:
+                # Configure/idle callbacks can arrive after a page switch has
+                # already destroyed the previous table widgets.
+                return
+
+        frame.bind("<Configure>", sync_horizontal_scrollbar)
+        tree.bind("<ButtonRelease-1>", lambda _event: self.after_idle(sync_horizontal_scrollbar), add="+")
+        self.after_idle(sync_horizontal_scrollbar)
         if not rows:
             tree.insert("", tk.END, values=["暂无数据"] + [""] * (len(columns) - 1), tags=("even",))
         if on_double_click:
@@ -1015,7 +1351,7 @@ class App(tk.Tk):
             body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         else:
             body = card
-        ttk.Label(body, text=title, background="#ffffff").pack(anchor="w")
+        ttk.Label(body, text=title, style="Surface.TLabel").pack(anchor="w")
         value_label = ttk.Label(body, text=str(value), style="Metric.TLabel")
         if accent:
             value_label.configure(foreground=accent)
@@ -1173,7 +1509,8 @@ class App(tk.Tk):
             self.metric_card(row2, "实际消耗", money_text(budget["cost"]), f"执行率 {percent_text(budget['cost'], budget['allocated'])}", self.colors["danger"] if budget["cost"] > budget["allocated"] and budget["allocated"] else None)
         role = self.current_role.get()
         msg = ROLE_DESCRIPTIONS.get(role, ROLE_DESCRIPTIONS["管理员"])
-        ttk.Label(self.content, text=f"当前视角：{role}。{msg}", wraplength=920).pack(anchor="w", pady=(2, 12))
+        ttk.Label(self.content, text=f"当前视角：{role}。{msg}", style="RoleBanner.TLabel",
+                  wraplength=920).pack(fill=tk.X, pady=(2, 12))
         self.role_dashboard_panel(project_id, version_id)
         self.section_title(self.content, "需求状态分布", "按当前项目统计，辅助判断项目推进节奏。")
         status_rows = self.db.query("""SELECT status, COUNT(*) c
@@ -1728,7 +2065,7 @@ class App(tk.Tk):
     def draw_budget_flow(self, project_id, plan_id, version_id):
         frame = ttk.Frame(self.content, style="Surface.TFrame", padding=12)
         frame.pack(fill=tk.X, pady=(0, 10))
-        canvas = tk.Canvas(frame, height=260, bg="#ffffff", highlightthickness=0)
+        canvas = tk.Canvas(frame, height=260, bg=self.colors["surface"], highlightthickness=0)
         canvas.pack(fill=tk.X, expand=True)
         project = self.db.one("SELECT project_name, total_budget FROM planning_projects WHERE id=?", (project_id,)) if project_id else None
         plan = self.db.one("SELECT plan_name, annual_budget FROM annual_plans WHERE id=?", (plan_id,)) if plan_id else None
@@ -1740,28 +2077,28 @@ class App(tk.Tk):
 
         def node(x, y, w, h, title, amount, color, tag=None):
             tags = (tag,) if tag else ()
-            canvas.create_rectangle(x, y, x + w, y + h, fill=color, outline="#d9e1ea", width=1, tags=tags)
-            canvas.create_text(x + 12, y + 14, text=title, anchor="w", fill="#172033", font=("Microsoft YaHei UI", 10, "bold"), width=w - 24, tags=tags)
-            canvas.create_text(x + 12, y + 42, text=money_text(amount), anchor="w", fill="#334155", font=("Microsoft YaHei UI", 10), tags=tags)
+            canvas.create_rectangle(x, y, x + w, y + h, fill=color, outline=self.colors["line"], width=1, tags=tags)
+            canvas.create_text(x + 12, y + 14, text=title, anchor="w", fill=self.colors["text"], font=("Microsoft YaHei UI", 10, "bold"), width=w - 24, tags=tags)
+            canvas.create_text(x + 12, y + 42, text=money_text(amount), anchor="w", fill="#3c514c", font=("Microsoft YaHei UI", 10), tags=tags)
 
-        node(20, 85, 180, 72, project["project_name"] if project else "未选择项目", project["total_budget"] if project else 0, "#e8f1ff")
-        node(250, 85, 180, 72, plan["plan_name"] if plan else "未选择年度", plan["annual_budget"] if plan else 0, "#e9f8f0")
+        node(20, 85, 180, 72, project["project_name"] if project else "未选择项目", project["total_budget"] if project else 0, "#e5f0f4")
+        node(250, 85, 180, 72, plan["plan_name"] if plan else "未选择年度", plan["annual_budget"] if plan else 0, "#e4f1e9")
         version_amount = version["version_budget"] if version else 0
-        node(480, 85, 180, 72, f"{version['version_code']} {version['version_name']}" if version else "未选择版本", version_amount, "#fff5dc")
+        node(480, 85, 180, 72, f"{version['version_code']} {version['version_name']}" if version else "未选择版本", version_amount, "#fff1d8")
         for x in (200, 430):
-            canvas.create_line(x, 121, x + 50, 121, arrow=tk.LAST, fill="#94a3b8", width=2)
+            canvas.create_line(x, 121, x + 50, 121, arrow=tk.LAST, fill="#8aa09a", width=2)
         if not requirements:
-            node(720, 85, 220, 72, "暂无版本需求", 0, "#eef2f7")
-            canvas.create_line(660, 121, 720, 121, arrow=tk.LAST, fill="#94a3b8", width=2)
+            node(720, 85, 220, 72, "暂无版本需求", 0, "#edf1ef")
+            canvas.create_line(660, 121, 720, 121, arrow=tk.LAST, fill="#8aa09a", width=2)
             return
         y = 20
         for req in requirements:
             over = (req["actual_cost"] or 0) > (req["allocated_budget"] or 0) and (req["allocated_budget"] or 0) > 0
-            color = "#ffecec" if over else "#e8f7f5"
+            color = "#f9e7e5" if over else "#e3f2ef"
             tag = f"req_node_{req['id']}"
             node(720, y, 240, 42, f"{req['requirement_code']} {req['requirement_name']}", req["allocated_budget"], color, tag=tag)
-            canvas.create_text(730, y + 33, text=f"实际 {money_text(req['actual_cost'])}", anchor="w", fill="#64748b", font=("Microsoft YaHei UI", 9), tags=(tag,))
-            canvas.create_line(660, 121, 720, y + 21, arrow=tk.LAST, fill="#94a3b8", width=1)
+            canvas.create_text(730, y + 33, text=f"实际 {money_text(req['actual_cost'])}", anchor="w", fill=self.colors["muted"], font=("Microsoft YaHei UI", 9), tags=(tag,))
+            canvas.create_line(660, 121, 720, y + 21, arrow=tk.LAST, fill="#8aa09a", width=1)
             canvas.tag_bind(tag, "<Enter>", lambda _event: canvas.configure(cursor="hand2"))
             canvas.tag_bind(tag, "<Leave>", lambda _event: canvas.configure(cursor=""))
             canvas.tag_bind(tag, "<Double-Button-1>", lambda _event, rid=req["id"]: self.open_requirement_detail(rid))
@@ -1800,7 +2137,6 @@ class App(tk.Tk):
                         return
                     self.db.record_budget_flow(code, self.current_project_id(), self.current_plan_id(), self.current_version_id(), requirement_id,
                                                flow_type, amount, d.result["description"], self.current_user, t, allow_actual_overrun=True)
-                self.db.log(self.current_user, "budget_flow", None, "create", "", d.result, "登记资金流水")
                 self.show_budget()
             except Exception as exc:
                 messagebox.showerror("保存失败", str(exc))
@@ -1809,6 +2145,7 @@ class App(tk.Tk):
         self.clear("成果物管理")
         bar = self.make_action_bar(self.content)
         ttk.Button(bar, text="挂载本地文件", command=self.add_artifact, style="Primary.TButton").pack(side=tk.LEFT)
+        ttk.Button(bar, text="打开附件", command=self.open_selected_artifact).pack(side=tk.LEFT, padx=(8, 0))
         context_ids = [
             ("项目", self.current_project_id()),
             ("年度", self.current_plan_id()),
@@ -1830,7 +2167,47 @@ class App(tk.Tk):
             item = dict(r)
             item["stage"] = ARTIFACT_STAGE_HINTS.get(item["artifact_type"], "其他")
             rows.append(item)
-        self.add_table(self.content, [("artifact_code", "成果物编号", 130), ("artifact_name", "名称", 180), ("stage", "业务阶段", 110), ("artifact_type", "类型", 110), ("related_object_type", "挂载对象", 90), ("related_object_id", "对象ID", 70), ("version_no", "文件版本", 90), ("file_path", "文件路径", 320), ("uploaded_by", "上传人", 90), ("uploaded_at", "上传时间", 150)], rows)
+        self.artifact_tree = self.add_table(self.content, [("artifact_code", "成果物编号", 130), ("artifact_name", "名称", 180), ("stage", "业务阶段", 110), ("artifact_type", "类型", 110), ("related_object_type", "挂载对象", 90), ("related_object_id", "对象ID", 70), ("version_no", "文件版本", 90), ("file_path", "文件路径", 320), ("uploaded_by", "上传人", 90), ("uploaded_at", "上传时间", 150)], rows, on_double_click=self.open_selected_artifact)
+
+    def selected_artifact(self):
+        selection = getattr(self, "artifact_tree", None).selection() if hasattr(self, "artifact_tree") else ()
+        if not selection:
+            messagebox.showwarning("提示", "请先选择一个成果物。")
+            return None
+        artifact_code = self.artifact_tree.item(selection[0])["values"][0]
+        return self.db.one("SELECT id, artifact_code, artifact_name, file_path FROM artifacts WHERE artifact_code=?", (artifact_code,))
+
+    def open_selected_artifact(self, _event=None):
+        artifact = self.selected_artifact()
+        if not artifact:
+            return
+        stored = Path(artifact["file_path"])
+        candidates = [stored] if stored.is_absolute() else [self.db.data_dir / stored, self.db.base_dir / stored]
+        allowed_roots = [self.db.data_dir.resolve(), self.db.base_dir.resolve()]
+        path = None
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            try:
+                if not any(resolved.is_relative_to(root) for root in allowed_roots):
+                    continue
+            except AttributeError:
+                if not any(str(resolved).startswith(str(root) + os.sep) for root in allowed_roots):
+                    continue
+            if resolved.is_file():
+                path = resolved
+                break
+        if not path:
+            messagebox.showerror("附件不存在", f"未找到文件：{artifact['file_path']}")
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(str(path))
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+            self.db.log(self.current_user, "artifact", artifact["id"], "open", "", artifact["file_path"], "打开成果物附件")
+        except Exception as exc:
+            LOGGER.exception("open_artifact_failed code=%s", artifact["artifact_code"])
+            messagebox.showerror("打开失败", str(exc))
 
     def validate_artifact_target(self, object_type, object_id):
         queries = {
@@ -1866,10 +2243,11 @@ class App(tk.Tk):
                 t = now_text()
                 self.db.execute("""INSERT INTO artifacts(artifact_code, artifact_name, artifact_type, file_path, file_ext, file_size, related_object_type, related_object_id, version_no, description, uploaded_by, uploaded_at, created_at)
                                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                (code, src.name, d.result["artifact_type"], str(dest.relative_to(self.db.base_dir)), src.suffix, dest.stat().st_size, d.result["related_object_type"], object_id, d.result["version_no"], d.result["description"], self.current_user, t, t))
+                                (code, src.name, d.result["artifact_type"], str(dest.relative_to(self.db.data_dir)), src.suffix, dest.stat().st_size, d.result["related_object_type"], object_id, d.result["version_no"], d.result["description"], self.current_user, t, t))
                 self.db.log(self.current_user, "artifact", None, "create", source, dest, "挂载成果物文件")
                 self.show_artifacts()
             except (OSError, ValueError, sqlite3.DatabaseError) as exc:
+                log_transaction_exception("add_artifact", exc)
                 if dest and dest.exists():
                     dest.unlink()
                 messagebox.showerror("保存失败", str(exc))
@@ -1975,7 +2353,7 @@ class App(tk.Tk):
         if self.current_role.get() == "管理员":
             ttk.Button(self.content, text="创建本地备份 ZIP", command=self.create_backup).pack(anchor="w", pady=5)
             ttk.Button(self.content, text="从备份 ZIP 恢复", command=self.restore_backup).pack(anchor="w", pady=5)
-        ttk.Label(self.content, text=f"导出目录：{self.db.exports_dir}\n备份目录：{self.db.backups_dir}", wraplength=900).pack(anchor="w", pady=(12, 0))
+        ttk.Label(self.content, text=f"导出目录：{self.db.exports_dir}\n备份目录：{self.db.backups_dir}\n日志目录：{self.db.logs_dir}", wraplength=900).pack(anchor="w", pady=(12, 0))
 
     def export_csv(self, name, rows):
         path = self.db.exports_dir / f"{name}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
@@ -2012,7 +2390,7 @@ class App(tk.Tk):
             z.write(self.db.db_path, "app.db")
             z.writestr("attachments/", "")
             for file in self.db.attachments_dir.rglob("*"):
-                if file.is_file():
+                if file.is_file() and not file.is_symlink():
                     z.write(file, f"attachments/{file.relative_to(self.db.attachments_dir).as_posix()}")
         self.db.log(self.current_user, "backup", None, "create", "", backup, "创建本地备份")
         messagebox.showinfo("备份完成", str(backup))
@@ -2036,11 +2414,7 @@ class App(tk.Tk):
             with tempfile.TemporaryDirectory(prefix="crm-restore-") as temp_dir:
                 temp_path = Path(temp_dir)
                 with zipfile.ZipFile(source, "r") as z:
-                    names = z.namelist()
-                    if any(Path(name).is_absolute() or ".." in Path(name).parts for name in names):
-                        raise ValueError("备份包含不安全路径。")
-                    if "app.db" not in names:
-                        raise ValueError("备份缺少 app.db。")
+                    validate_restore_archive(z, required_names=("app.db",))
                     z.extractall(temp_path)
                 restored_db = temp_path / "app.db"
                 check_conn = sqlite3.connect(restored_db)
@@ -2061,7 +2435,7 @@ class App(tk.Tk):
                 with zipfile.ZipFile(safety, "w", zipfile.ZIP_DEFLATED) as z:
                     z.write(self.db.db_path, "app.db")
                     for file in self.db.attachments_dir.rglob("*"):
-                        if file.is_file():
+                        if file.is_file() and not file.is_symlink():
                             z.write(file, f"attachments/{file.relative_to(self.db.attachments_dir).as_posix()}")
 
                 self.db.conn.close()
@@ -2070,14 +2444,24 @@ class App(tk.Tk):
                 os.replace(staged_db, self.db.db_path)
                 os.replace(self.db.attachments_dir, old_attachments)
                 os.replace(staged_attachments, self.db.attachments_dir)
+                self.db.conn = sqlite3.connect(self.db.db_path)
+                self.db.conn.row_factory = sqlite3.Row
+                try:
+                    self.db.init_schema()
+                    self.db.log(self.current_user, "backup", None, "restore", str(source), str(safety), "恢复本地备份")
+                finally:
+                    self.db.close()
                 try:
                     old_db.unlink(missing_ok=True)
                     shutil.rmtree(old_attachments, ignore_errors=True)
                 except OSError:
                     pass
+            LOGGER.info("backup_restore_succeeded source=%s safety=%s", source, safety)
             messagebox.showinfo("恢复完成", f"已恢复备份。恢复前快照：{safety}\n请重新启动程序。")
+            close_logging()
             self.destroy()
         except (OSError, ValueError, sqlite3.DatabaseError, zipfile.BadZipFile) as exc:
+            log_transaction_exception("restore_backup", exc)
             try:
                 if old_db.exists():
                     if self.db.db_path.exists():
@@ -2088,6 +2472,7 @@ class App(tk.Tk):
                         shutil.rmtree(self.db.attachments_dir)
                     os.replace(old_attachments, self.db.attachments_dir)
             except OSError as rollback_exc:
+                LOGGER.exception("restore_rollback_failed")
                 messagebox.showerror("自动回滚失败", f"请使用恢复前安全快照人工恢复：{rollback_exc}")
             if staged_db.exists():
                 staged_db.unlink(missing_ok=True)
@@ -2105,6 +2490,11 @@ class App(tk.Tk):
             return
         self.clear("系统设置")
         ttk.Label(self.content, text="本机账号：默认管理员。支持通过右上角角色选择器查看不同角色视图。", style="SubTitle.TLabel").pack(anchor="w", pady=(0, 8))
+        self.section_title(self.content, "运行日志", "运行、错误和审计日志按大小自动分卷；数据库操作日志仍可在本页查询。")
+        log_bar = self.make_action_bar(self.content)
+        ttk.Button(log_bar, text="打开日志目录", command=self.open_logs_directory).pack(side=tk.LEFT)
+        ttk.Button(log_bar, text="运行健康检查", command=self.run_healthcheck).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(log_bar, text=f"{self.db.logs_dir}  |  runtime.log / error.log / audit.log").pack(side=tk.LEFT, padx=(10, 0))
         self.section_title(self.content, "变更申请", "冻结版本内的需求修改、删除会进入此列表，由管理员或咨询负责人审批。")
         bar = self.make_action_bar(self.content)
         ttk.Label(bar, text="状态").pack(side=tk.LEFT)
@@ -2127,8 +2517,44 @@ class App(tk.Tk):
                                     ORDER BY c.id DESC LIMIT 80""", params)
         self.change_tree = self.add_table(self.content, [("id", "ID", 50), ("approval_status", "状态", 90), ("version_code", "版本", 90), ("requirement_code", "需求编号", 130), ("change_title", "标题", 260), ("requested_by", "申请人", 90), ("requested_at", "申请时间", 150), ("approved_by", "审批人", 90), ("approved_at", "审批时间", 150)], changes, 8)
         self.section_title(self.content, "操作日志", "记录关键数据修改、状态流转、版本冻结、成果物上传和备份等动作。")
-        rows = self.db.query("SELECT operator_name, operation_time, object_type, object_id, operation_type, description FROM operation_logs ORDER BY id DESC LIMIT 80")
-        self.add_table(self.content, [("operator_name", "操作人", 100), ("operation_time", "时间", 150), ("object_type", "对象", 120), ("object_id", "对象ID", 70), ("operation_type", "操作", 120), ("description", "说明", 360)], rows, 10)
+        audit_bar = self.make_action_bar(self.content)
+        ttk.Label(audit_bar, text="对象类型").pack(side=tk.LEFT)
+        type_box = ttk.Combobox(audit_bar, textvariable=self.operation_log_type_filter,
+                                values=["全部", "system", "permission", "planning_project", "annual_plan", "implementation_version", "requirement", "budget_flow", "artifact", "change_request", "backup", "healthcheck"],
+                                state="readonly", width=22)
+        type_box.pack(side=tk.LEFT, padx=(6, 10))
+        type_box.bind("<<ComboboxSelected>>", lambda _e: self.show_settings())
+        ttk.Label(audit_bar, text="关键词").pack(side=tk.LEFT)
+        ttk.Entry(audit_bar, textvariable=self.operation_log_keyword, width=24).pack(side=tk.LEFT, padx=(6, 8))
+        ttk.Button(audit_bar, text="查询", command=self.show_settings).pack(side=tk.LEFT)
+        ttk.Button(audit_bar, text="导出审计 CSV", command=self.export_operation_logs).pack(side=tk.LEFT, padx=(8, 0))
+        rows = self.filtered_operation_logs(limit=200)
+        self.add_table(self.content, [("operation_time", "时间", 150), ("operator_name", "操作人", 100), ("object_type", "对象", 110), ("operation_type", "操作", 110), ("result", "结果", 70), ("event_id", "事件ID", 170), ("description", "说明", 280)], rows, 10)
+
+    def filtered_operation_logs(self, limit=None):
+        where = []
+        params = []
+        if self.operation_log_type_filter.get() != "全部":
+            where.append("object_type=?")
+            params.append(self.operation_log_type_filter.get())
+        keyword = self.operation_log_keyword.get().strip()
+        if keyword:
+            where.append("(operator_name LIKE ? OR operation_type LIKE ? OR event_id LIKE ? OR result LIKE ? OR description LIKE ?)")
+            like = f"%{keyword}%"
+            params.extend([like, like, like, like, like])
+        sql = "SELECT * FROM operation_logs"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY id DESC"
+        if limit:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return self.db.query(sql, tuple(params))
+
+    def export_operation_logs(self):
+        if not self.require_action("approve", "导出审计日志"):
+            return
+        self.export_csv("operation_logs", self.filtered_operation_logs())
 
     def selected_change_id(self):
         sel = getattr(self, "change_tree", None).selection() if hasattr(self, "change_tree") else ()
@@ -2169,4 +2595,15 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    try:
+        App().mainloop()
+    except SystemExit:
+        LOGGER.info("application_exit_requested")
+        raise
+    except Exception as exc:
+        LOGGER.exception("application_fatal_error")
+        try:
+            messagebox.showerror("启动失败", f"{exc}\n请查看 data/logs/error.log")
+        except Exception:
+            pass
+        raise
