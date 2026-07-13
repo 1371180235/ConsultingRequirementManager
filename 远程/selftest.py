@@ -106,7 +106,7 @@ def offline_checks():
         config = {
             "host": "127.0.0.1", "port": 3306, "user": "crm_user", "password": "",
             "password_env": "CRM_SELFTEST_DB_PASSWORD", "database": "crm_selftest",
-            "attachment_storage": "server", "attachments_dir": "",
+            "attachment_storage": "server", "attachments_dir": str(Path(temp_dir) / "shared" / "attachments"),
         }
         db.config_path.write_text(json.dumps(config), encoding="utf-8")
         old_value = os.environ.get("CRM_SELFTEST_DB_PASSWORD")
@@ -114,6 +114,13 @@ def offline_checks():
         try:
             loaded = db.load_config()
             assert_true(loaded["password"] == "environment-secret", "数据库密码环境变量未生效")
+            config["create_database"] = "false"
+            db.config_path.write_text(json.dumps(config), encoding="utf-8")
+            try:
+                db.load_config()
+                raise AssertionError("字符串 false 被错误接受为布尔配置")
+            except RuntimeError as exc:
+                assert_true("JSON 布尔值" in str(exc), "布尔配置错误提示不明确")
         finally:
             if old_value is None:
                 os.environ.pop("CRM_SELFTEST_DB_PASSWORD", None)
@@ -250,7 +257,8 @@ def main():
         assert_true(all(row["object_type"] == "system" for row in root.filtered_operation_logs(limit=20)), "操作日志类型过滤失败")
         root.operation_log_type_filter.set("全部")
 
-        for table in ["requirement_status_history", "version_baselines", "version_baseline_requirements", "user_project_access"]:
+        for table in ["requirement_status_history", "version_baselines", "version_baseline_requirements", "user_project_access",
+                      "task_effort_entries", "tag_definitions", "dashboard_preferences"]:
             root.db.one(f"SELECT COUNT(*) c FROM {table}")
 
         assert_true(root.db.healthcheck()["free_bytes"] > 0, "远程部署健康检查失败")

@@ -176,6 +176,16 @@ def run_checks():
         root.show_projects()
         root.update_idletasks()
         root.update()
+        root.geometry("1100x680")
+        root.show_dashboard()
+        root.update_idletasks()
+        root.update()
+        for frame in root.content.winfo_children():
+            cards = [child for child in frame.winfo_children() if child.grid_info()]
+            for card in cards:
+                assert_true(card.winfo_x() + card.winfo_width() <= frame.winfo_width() + 1,
+                            "最小窗口宽度下指标卡超出内容区")
+        root.geometry("1280x760")
 
         pages = [
             root.show_dashboard,
@@ -205,9 +215,21 @@ def run_checks():
         assert_true(all(row["object_type"] == "system" for row in root.filtered_operation_logs(limit=20)), "操作日志类型过滤失败")
         root.operation_log_type_filter.set("全部")
 
-        for table in ["requirement_status_history", "version_baselines", "version_baseline_requirements"]:
+        for table in ["requirement_status_history", "version_baselines", "version_baseline_requirements",
+                      "task_effort_entries", "tag_definitions", "dashboard_preferences"]:
             exists = root.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
             assert_true(exists is not None, f"升级表未创建：{table}")
+        req_columns = {row[1] for row in root.db.query("PRAGMA table_info(requirements)")}
+        assert_true({"business_key", "estimated_hours", "actual_hours"}.issubset(req_columns), "需求增强字段未迁移")
+        requirement_id = root.db.one("SELECT id FROM requirements WHERE is_deleted=0 ORDER BY id LIMIT 1")["id"]
+        root.db.claim_requirement(requirement_id, root.current_user, app.now_text())
+        root.db.record_effort(requirement_id, root.current_user, 1.5, "2026-07-10", "自测工时", app.now_text())
+        assert_true(float(root.db.one("SELECT actual_hours FROM requirements WHERE id=?", (requirement_id,))["actual_hours"]) >= 1.5,
+                    "任务工时未累计")
+        layout = [{"key": "recent", "visible": True}, {"key": "status", "visible": False}]
+        root.save_dashboard_layout("客户", layout)
+        loaded_layout = root.load_dashboard_layout("客户")
+        assert_true(loaded_layout[0]["key"] == "recent" and loaded_layout[1]["visible"] is False, "角色看板配置未持久化")
 
         assert_true("规划中" in app.STATUS_TRANSITIONS["草稿"], "需求状态机规则缺失")
         root.current_role.set("客户")

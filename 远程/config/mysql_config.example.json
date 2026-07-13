@@ -12,7 +12,7 @@
   "write_timeout": 30,
   "ssl_ca": "",
   "attachment_storage": "server",
-  "attachments_dir": "/opt/consulting-requirement-manager/attachments",
+  "attachments_dir": "",
   "oss_endpoint": "",
   "oss_bucket": "",
   "oss_prefix": "consulting-requirement-manager"
