@@ -12,6 +12,17 @@ def assert_true(condition, message):
         raise AssertionError(message)
 
 
+def contrast_ratio(foreground, background):
+    def luminance(value):
+        channels = [int(value[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+        channels = [channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+                    for channel in channels]
+        return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+    light, dark = sorted((luminance(foreground), luminance(background)), reverse=True)
+    return (light + 0.05) / (dark + 0.05)
+
+
 def assert_log_files(logs_dir):
     app.LOGGER.info("selftest_runtime_marker")
     app.LOGGER.error("selftest_error_marker")
@@ -238,6 +249,14 @@ def test_database_transactions():
             except ValueError:
                 pass
             before_allocated = float(req["allocated_budget"] or 0)
+            for flow_type, invalid_amount in (("已分配预算", -1), ("实际消耗", -1), ("调整金额", 0)):
+                try:
+                    db.record_budget_flow(f"BF-SELFTEST-AMOUNT-{flow_type}", req["project_id"], req["annual_plan_id"],
+                                          req["version_id"], req["id"], flow_type, invalid_amount,
+                                          "非法金额", "自测", app.now_text())
+                    raise AssertionError(f"非法资金金额未被拒绝：{flow_type}/{invalid_amount}")
+                except ValueError:
+                    pass
             db.record_budget_flow("BF-SELFTEST-1", req["project_id"], req["annual_plan_id"], req["version_id"], req["id"],
                                   "已分配预算", 1000, "selftest", "自测", app.now_text())
             after = db.one("SELECT allocated_budget FROM requirements WHERE id=?", (req["id"],))
@@ -557,8 +576,8 @@ def test_database_transactions():
 
             operation_id = db.create_operation_record({
                 "record_code": "OPS-SELFTEST", "project_id": req["project_id"], "version_id": req["version_id"],
-                "requirement_id": req["id"], "record_type": "线上问题", "status": "已完成",
-                "record_date": "2026-07-15", "owner_name": "运营自测", "description": "问题说明", "result": "已解决",
+                "requirement_id": req["id"], "record_type": "功能建议", "status": "已完成",
+                "record_date": "2026-07-15", "owner_name": "运营自测", "description": "功能建议说明", "result": "已评估",
             }, "运营自测", t)
             assert_true(db.one("SELECT id FROM operation_records WHERE id=?", (operation_id,)) is not None,
                         "运营服务记录未保存")
@@ -600,9 +619,26 @@ def run_checks():
         {"id": 1, "project_id": 1, "version_id": 2, "business_key": "foo  bar", "requirement_name": "A"},
         {"id": 2, "project_id": 1, "version_id": 2, "business_key": " Foo Bar ", "requirement_name": "B"},
     ]), "同版本规范化业务标识冲突未被识别")
-    assert_true(tuple(app.THEME_PALETTES) == ("云岚蓝", "松石青", "靛夜紫", "石墨灰") and
+    assert_true(tuple(app.THEME_PALETTES) == ("专业蓝", "清雅绿", "暖灰橙", "深色模式") and
                 len({palette["primary"] for palette in app.THEME_PALETTES.values()}) == 4,
                 "四套主题名称或主色配置不完整")
+    assert_true("功能建议" in app.OPERATION_TYPES, "运营服务缺少功能建议收口类型")
+    dark_palette = app.THEME_PALETTES["深色模式"]
+    for foreground_key, background_key in (
+        ("text", "surface"), ("muted", "surface"), ("metric_primary", "surface"),
+        ("role_text", "role_bg"), ("success", "success_bg"),
+        ("warning", "warning_bg"), ("danger", "danger_bg"),
+    ):
+        assert_true(
+            contrast_ratio(dark_palette[foreground_key], dark_palette[background_key]) >= 4.5,
+            f"深色主题对比度不足：{foreground_key}/{background_key}",
+        )
+    for status, background in app.DARK_STATUS_COLORS.items():
+        assert_true(contrast_ratio(dark_palette["text"], background) >= 4.5,
+                    f"深色主题状态行对比度不足：{status}")
+    for diff_type, background in app.DARK_DIFF_COLORS.items():
+        assert_true(contrast_ratio(dark_palette["text"], background) >= 4.5,
+                    f"深色主题差异行对比度不足：{diff_type}")
     compare_left = {
         "requirement_code": "REQ-CMP", "requirement_name": "统一需求", "requirement_description": "旧描述",
         "source_role": "客户", "proposer_name": "甲", "owner_name": "乙", "requirement_type": "功能优化",
@@ -927,8 +963,14 @@ def run_checks():
             app.FieldDialog = original_field_dialog
         diff_tags = {tag for item in root.version_diff_tree.get_children("") for tag in root.version_diff_tree.item(item)["tags"]}
         assert_true("diff_新增" in diff_tags or "diff_移除" in diff_tags, "跨年度版本比对未标记新增/移除行")
+        highlighted_rows = [root.version_diff_tree.item(item)["tags"]
+                            for item in root.version_diff_tree.get_children("")
+                            if any(tag.startswith("diff_") for tag in root.version_diff_tree.item(item)["tags"])]
+        assert_true(highlighted_rows and all(len(row_tags) == 1 and row_tags[0].startswith("diff_")
+                                             for row_tags in highlighted_rows),
+                    "跨版本差异高亮被斑马纹或状态背景覆盖")
         selected_compare_ids = root.version_compare_ids
-        root.theme_name.set("松石青")
+        root.theme_name.set("清雅绿")
         root.apply_theme(persist=False)
         assert_true(root.current_page == "跨版本比对" and root.version_compare_ids == selected_compare_ids and
                     root.version_diff_tree.get_children(""), "跨版本结果在换肤后未保留")

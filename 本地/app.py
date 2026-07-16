@@ -84,55 +84,63 @@ DASHBOARD_SECTIONS = [
     ("trend", "需求推进趋势"),
     ("recent", "最近需求"),
 ]
-DEFAULT_THEME = "云岚蓝"
+DEFAULT_THEME = "专业蓝"
 THEME_PALETTES = {
-    "云岚蓝": {
-        "bg": "#F4F6F8", "surface": "#FFFFFF", "surface_alt": "#F8FAFC",
-        "side": "#F8FAFC", "side_hover": "#EEF2F6", "side_active": "#E3ECFC",
-        "side_text": "#475467", "side_active_text": "#1D4ED8", "brand_text": "#18212B",
-        "text": "#18212B", "muted": "#667085",
-        "line": "#DDE3EA", "primary": "#2563EB", "primary_active": "#1D4ED8",
-        "focus": "#3B82F6", "control_hover": "#EEF3F8", "selection": "#DCE9FF",
-        "selection_text": "#163A70", "status_bg": "#EDF1F4", "status_text": "#526172",
-        "heading_bg": "#EEF2F6", "heading_hover": "#E3E9F0", "heading_text": "#344054",
-        "role_bg": "#EAF2FF", "role_text": "#2457A6",
+    "专业蓝": {
+        "bg": "#F5F7FA", "surface": "#FFFFFF", "surface_alt": "#F8FAFC",
+        "side": "#20252D", "side_hover": "#2B323C", "side_active": "#2563EB",
+        "side_text": "#D9E0E8", "side_active_text": "#FFFFFF", "brand_text": "#FFFFFF",
+        "text": "#17202A", "muted": "#647184",
+        "line": "#D9E0E8", "primary": "#2563EB", "primary_active": "#1D4ED8",
+        "metric_primary": "#2563EB",
+        "focus": "#3B82F6", "control_hover": "#EEF2F6", "selection": "#DBEAFE",
+        "selection_text": "#153E75", "status_bg": "#EEF1F4", "status_text": "#526172",
+        "heading_bg": "#EEF2F6", "heading_hover": "#E2E8F0", "heading_text": "#344054",
+        "role_bg": "#E8F1FF", "role_text": "#1E4F9A",
         "success": "#15803D", "warning": "#A15C00", "danger": "#B42318",
+        "success_bg": "#E8F5EC", "warning_bg": "#FFF3D6", "danger_bg": "#FDE9E7",
     },
-    "松石青": {
-        "bg": "#F3F7F6", "surface": "#FFFFFF", "surface_alt": "#F7FAF9",
-        "side": "#1D2D2C", "side_hover": "#29403E", "side_active": "#0F766E",
-        "side_text": "#E4EFED", "side_active_text": "#FFFFFF", "brand_text": "#FFFFFF",
-        "text": "#172522", "muted": "#62716D",
-        "line": "#D8E3E0", "primary": "#0F766E", "primary_active": "#0B5F59",
-        "focus": "#14877E", "control_hover": "#EAF2F0", "selection": "#D8F0EC",
-        "selection_text": "#124E49", "status_bg": "#EAF0EE", "status_text": "#50625D",
-        "heading_bg": "#EAF1EF", "heading_hover": "#DFE9E6", "heading_text": "#304540",
-        "role_bg": "#E3F3EF", "role_text": "#17645C",
+    "清雅绿": {
+        "bg": "#F4F7F5", "surface": "#FFFFFF", "surface_alt": "#F7FAF8",
+        "side": "#20312E", "side_hover": "#2B423E", "side_active": "#059669",
+        "side_text": "#DCE9E5", "side_active_text": "#FFFFFF", "brand_text": "#FFFFFF",
+        "text": "#172522", "muted": "#61716C",
+        "line": "#D7E2DE", "primary": "#047857", "primary_active": "#065F46",
+        "metric_primary": "#047857",
+        "focus": "#059669", "control_hover": "#EAF2EF", "selection": "#D8F3E8",
+        "selection_text": "#12543F", "status_bg": "#EAF0EE", "status_text": "#50625D",
+        "heading_bg": "#EAF1EF", "heading_hover": "#DEE9E5", "heading_text": "#304540",
+        "role_bg": "#E1F3EC", "role_text": "#176148",
         "success": "#15803D", "warning": "#A15C00", "danger": "#B42318",
+        "success_bg": "#E8F5EC", "warning_bg": "#FFF3D6", "danger_bg": "#FDE9E7",
     },
-    "靛夜紫": {
-        "bg": "#F6F5F8", "surface": "#FFFFFF", "surface_alt": "#FAF9FC",
-        "side": "#282735", "side_hover": "#383648", "side_active": "#4F46E5",
-        "side_text": "#ECEAF5", "side_active_text": "#FFFFFF", "brand_text": "#FFFFFF",
-        "text": "#211F2C", "muted": "#6C687A",
-        "line": "#E1DFE8", "primary": "#4F46E5", "primary_active": "#4338CA",
-        "focus": "#6366F1", "control_hover": "#F0EFF5", "selection": "#E6E5FF",
-        "selection_text": "#3730A3", "status_bg": "#EFEDF3", "status_text": "#5D596A",
-        "heading_bg": "#F0EEF4", "heading_hover": "#E6E3EC", "heading_text": "#3F3B4D",
-        "role_bg": "#EEECFF", "role_text": "#4338CA",
+    "暖灰橙": {
+        "bg": "#F7F6F4", "surface": "#FFFFFF", "surface_alt": "#FAF9F7",
+        "side": "#302E2B", "side_hover": "#403D39", "side_active": "#C2410C",
+        "side_text": "#EBE7E2", "side_active_text": "#FFFFFF", "brand_text": "#FFFFFF",
+        "text": "#292724", "muted": "#706B65",
+        "line": "#E1DDD8", "primary": "#C2410C", "primary_active": "#9A3412",
+        "metric_primary": "#C2410C",
+        "focus": "#EA580C", "control_hover": "#F2EFEB", "selection": "#FFEDD5",
+        "selection_text": "#7C2D12", "status_bg": "#EFEEEC", "status_text": "#5F5A54",
+        "heading_bg": "#F1EFEC", "heading_hover": "#E7E3DE", "heading_text": "#49443E",
+        "role_bg": "#FFF0E3", "role_text": "#9A3412",
         "success": "#15803D", "warning": "#A15C00", "danger": "#B42318",
+        "success_bg": "#E8F5EC", "warning_bg": "#FFF3D6", "danger_bg": "#FDE9E7",
     },
-    "石墨灰": {
-        "bg": "#F4F5F6", "surface": "#FFFFFF", "surface_alt": "#F8F9FA",
-        "side": "#222529", "side_hover": "#31353A", "side_active": "#475467",
-        "side_text": "#ECEFF2", "side_active_text": "#FFFFFF", "brand_text": "#FFFFFF",
-        "text": "#202327", "muted": "#66707A",
-        "line": "#DDE1E5", "primary": "#344054", "primary_active": "#252F3F",
-        "focus": "#52677F", "control_hover": "#EEF0F2", "selection": "#E4E8ED",
-        "selection_text": "#273444", "status_bg": "#ECEFF1", "status_text": "#515B66",
-        "heading_bg": "#EEF0F2", "heading_hover": "#E3E6E9", "heading_text": "#3A424B",
-        "role_bg": "#E9EEF3", "role_text": "#3D5268",
-        "success": "#15803D", "warning": "#A15C00", "danger": "#B42318",
+    "深色模式": {
+        "bg": "#11151B", "surface": "#1C222B", "surface_alt": "#222A35",
+        "side": "#0B0F14", "side_hover": "#202832", "side_active": "#2563EB",
+        "side_text": "#CED5DF", "side_active_text": "#FFFFFF", "brand_text": "#FFFFFF",
+        "text": "#F1F5F9", "muted": "#AAB4C2",
+        "line": "#374151", "primary": "#1E40AF", "primary_active": "#1E3A8A",
+        "metric_primary": "#60A5FA",
+        "focus": "#60A5FA", "control_hover": "#2A3340", "selection": "#23447A",
+        "selection_text": "#F8FAFC", "status_bg": "#171D25", "status_text": "#BCC6D3",
+        "heading_bg": "#252D38", "heading_hover": "#303A47", "heading_text": "#E5EAF0",
+        "role_bg": "#1E3A5F", "role_text": "#D7E9FF",
+        "success": "#4ADE80", "warning": "#FBBF24", "danger": "#F87171",
+        "success_bg": "#153524", "warning_bg": "#3A2B12", "danger_bg": "#3A1E24",
     },
 }
 STATUS_COLORS = {
@@ -154,6 +162,16 @@ STATUS_ACCENTS = {
     "已拨付": "#0F766E", "待处理": "#C2410C", "处理中": "#A15C00",
 }
 DIFF_COLORS = {"新增": "#E5F3EA", "移除": "#FBE9E8", "变更": "#FFF2D8"}
+DARK_STATUS_COLORS = {
+    "草稿": "#2B313A", "规划中": "#1B3354", "已排期": "#183B36",
+    "研发中": "#3C3018", "待验收": "#3B271C", "已上线运维": "#1A392B",
+    "已关闭": "#2A3139", "已驳回": "#452426", "已挂起": "#33294A",
+    "已取消": "#2B313A", "变更中": "#43243E", "退回修改": "#452426",
+    "已完成": "#183B2B", "当前阶段": "#3C3018", "未开始": "#2B313A",
+    "已提交": "#1B3354", "审批中": "#3C3018", "已批复": "#183B2B",
+    "已拨付": "#183B36", "待处理": "#3B271C", "处理中": "#3C3018",
+}
+DARK_DIFF_COLORS = {"新增": "#183B2B", "移除": "#452426", "变更": "#3C3018"}
 ARTIFACT_STAGE_HINTS = {
     "可研报告": "宏观规划",
     "分年任务申报书": "规划细化",
@@ -177,7 +195,7 @@ FUNDING_TRANSITIONS = {
     "已驳回": [],
     "已拨付": [],
 }
-OPERATION_TYPES = ["推广活动", "线上问题", "维护记录", "问题解答"]
+OPERATION_TYPES = ["推广活动", "线上问题", "维护记录", "问题解答", "功能建议"]
 OPERATION_STATUSES = ["待处理", "处理中", "已完成", "已关闭"]
 ARTIFACT_TARGET_TYPES = {
     "可研报告": {"项目"},
@@ -507,6 +525,11 @@ class Database:
             if not math.isfinite(amount):
                 raise ValueError("资金金额必须是有限数值。")
             amount = round(amount, 2)
+            if flow_type == "调整金额":
+                if amount == 0:
+                    raise ValueError("调整金额不能为 0。")
+            elif amount <= 0:
+                raise ValueError("除调整金额外，资金流水金额必须大于 0。")
             req = None
             version = self.conn.execute("SELECT version_budget, is_frozen FROM implementation_versions WHERE id=?", (version_id,)).fetchone() if version_id else None
             if version_id and not version:
@@ -1251,7 +1274,7 @@ class Database:
             "项目阶段": "SELECT COUNT(*) c FROM planning_projects WHERE current_stage NOT IN ('宏观规划','规划细化','建设落地','招投标','项目交付验收','运维运营')",
             "成果物状态": "SELECT COUNT(*) c FROM artifacts WHERE visibility NOT IN ('内部','客户可见') OR approval_status NOT IN ('pending','approved','rejected')",
             "资金申报状态": "SELECT COUNT(*) c FROM funding_applications WHERE status NOT IN ('草稿','已提交','审批中','已批复','已驳回','已拨付') OR amount<=0",
-            "运营记录枚举": "SELECT COUNT(*) c FROM operation_records WHERE record_type NOT IN ('推广活动','线上问题','维护记录','问题解答') OR status NOT IN ('待处理','处理中','已完成','已关闭')",
+            "运营记录枚举": "SELECT COUNT(*) c FROM operation_records WHERE record_type NOT IN ('推广活动','线上问题','维护记录','问题解答','功能建议') OR status NOT IN ('待处理','处理中','已完成','已关闭')",
         }
         for label, sql in value_checks.items():
             if self.conn.execute(sql).fetchone()["c"]:
@@ -2221,10 +2244,10 @@ class App(tk.Tk):
 
     def notice_banner(self, parent, text, tone="info"):
         palette = {
-            "info": (self.colors["role_bg"], self.colors["primary"]),
-            "success": ("#E8F5EC", self.colors["success"]),
-            "warning": ("#FFF3D6", self.colors["warning"]),
-            "danger": ("#FDE9E7", self.colors["danger"]),
+            "info": (self.colors["role_bg"], self.colors["role_text"]),
+            "success": (self.colors["success_bg"], self.colors["success"]),
+            "warning": (self.colors["warning_bg"], self.colors["warning"]),
+            "danger": (self.colors["danger_bg"], self.colors["danger"]),
         }
         background, foreground = palette.get(tone, palette["info"])
         frame = tk.Frame(parent, bg=background, highlightbackground=foreground, highlightthickness=1, padx=12, pady=9)
@@ -2342,7 +2365,7 @@ class App(tk.Tk):
             bar_height = 110 * value / maximum
             x1 = 28 + index * slot + slot * 0.2
             x2 = 28 + (index + 1) * slot - slot * 0.2
-            canvas.create_rectangle(x1, 145 - bar_height, x2, 145, fill=self.colors["primary"], outline="")
+            canvas.create_rectangle(x1, 145 - bar_height, x2, 145, fill=self.colors["metric_primary"], outline="")
             canvas.create_text((x1 + x2) / 2, 137 - bar_height, text=str(value), fill=self.colors["text"])
             canvas.create_text((x1 + x2) / 2, 164, text=day[5:], fill=self.colors["muted"])
 
@@ -2519,18 +2542,20 @@ class App(tk.Tk):
             tree.column(key, width=width, anchor="w")
         tree.tag_configure("odd", background=self.colors["surface"])
         tree.tag_configure("even", background=self.colors["surface_alt"])
-        for status, color in STATUS_COLORS.items():
-            tree.tag_configure(f"status_{status}", background=color)
-        for diff_type, color in DIFF_COLORS.items():
-            tree.tag_configure(f"diff_{diff_type}", background=color)
+        dark_theme = self.theme_name.get() == "深色模式"
+        status_colors = DARK_STATUS_COLORS if dark_theme else STATUS_COLORS
+        diff_colors = DARK_DIFF_COLORS if dark_theme else DIFF_COLORS
+        for status, color in status_colors.items():
+            tree.tag_configure(f"status_{status}", background=color, foreground=self.colors["text"])
+        for diff_type, color in diff_colors.items():
+            tree.tag_configure(f"diff_{diff_type}", background=color, foreground=self.colors["text"])
         for index, row in enumerate(rows):
-            tags = ["even" if index % 2 else "odd"]
-            status = self.row_value(row, "status")
-            if status in STATUS_COLORS:
-                tags.append(f"status_{status}")
             diff_type = self.row_value(row, "diff_type")
             if diff_type in {"新增", "移除", "变更"}:
-                tags.append(f"diff_{diff_type}")
+                tags = [f"diff_{diff_type}"]
+            else:
+                status = self.row_value(row, "status")
+                tags = [f"status_{status}"] if status in STATUS_COLORS else ["even" if index % 2 else "odd"]
             tree.insert("", tk.END, values=[self.row_value(row, c[0]) for c in columns], tags=tuple(tags))
         tree.grid(row=0, column=0, sticky="nsew")
         if len(rows) > visible_rows:
@@ -2598,16 +2623,17 @@ class App(tk.Tk):
             parent.columnconfigure(col, weight=1, uniform="metric")
         else:
             card.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10), pady=(0, 10))
-        if accent:
-            tk.Frame(card, bg=accent, width=4, height=54).pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        display_accent = self.colors["metric_primary"] if accent == self.colors["primary"] else accent
+        if display_accent:
+            tk.Frame(card, bg=display_accent, width=4, height=54).pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
             body = ttk.Frame(card, style="Surface.TFrame")
             body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         else:
             body = card
         ttk.Label(body, text=title, style="Surface.TLabel").pack(anchor="w")
         value_label = ttk.Label(body, text=str(value), style="Metric.TLabel")
-        if accent:
-            value_label.configure(foreground=accent)
+        if display_accent:
+            value_label.configure(foreground=display_accent)
         value_label.pack(anchor="w", pady=(8, 0))
         if hint:
             ttk.Label(body, text=hint, style="Muted.TLabel").pack(anchor="w", pady=(4, 0))

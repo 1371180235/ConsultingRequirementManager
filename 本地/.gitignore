@@ -8,5 +8,6 @@ data/
 *.log
 *.zip
 *.exe
+!ConsultingRequirementManagerSetup.exe
 .venv/
 venv/

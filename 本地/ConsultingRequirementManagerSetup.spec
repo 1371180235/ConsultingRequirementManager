@@ -9,7 +9,7 @@ a = Analysis(
     ['installer.py'],
     pathex=[],
     binaries=[(str(project_dir / 'dist' / 'ConsultingRequirementManager.exe'), '.')],
-    datas=[],
+    datas=[(str(project_dir / 'EULA_zh-CN.txt'), '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
