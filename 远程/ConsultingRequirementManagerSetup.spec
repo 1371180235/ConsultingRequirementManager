@@ -9,7 +9,7 @@ a = Analysis(
     ['installer.py'],
     pathex=[],
     binaries=[(str(project_dir / 'dist' / 'ConsultingRequirementManager.exe'), '.')],
-    datas=[],
+    datas=[(str(project_dir / 'config' / 'mysql_config.example.json'), 'config')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

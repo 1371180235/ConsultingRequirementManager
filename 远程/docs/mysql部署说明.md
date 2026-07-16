@@ -1,4 +1,8 @@
-# MySQL 远程版 Linux 部署说明
+# MySQL 8.x LTS 远程版 Linux 部署说明
+
+适用版本：应用 v1.6.3；数据库 MySQL 8.x（推荐 8.4 LTS）
+
+基线日期：2026-07-16
 
 本文适用于 Linux MySQL 8.x 服务器和 Windows/Linux 桌面客户端。远程版是桌面程序，不是部署在 Linux 上的 Web 服务；Linux 主要承载 MySQL，以及可选的共享附件目录。
 
@@ -31,7 +35,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER
 FLUSH PRIVILEGES;
 ```
 
-把 `10.0.%` 改为真实客户端网段或固定来源。不要使用 root，不要默认使用 `'%'`。当前程序启动时执行 `CREATE TABLE IF NOT EXISTS`，因此账号需要 `CREATE`。1.5.0 从旧库升级时会在 MySQL `GET_LOCK` 保护下为审计表补列和唯一索引，需要一次性 `ALTER`；测试库升级验证完成后执行 `REVOKE ALTER ON consulting_requirement_manager.* FROM 'crm_user'@'10.0.%';`。不需要 `DROP`、`GRANT OPTION` 或全库权限。
+把 `10.0.%` 改为真实客户端网段或固定来源。不要使用 root，不要默认使用 `'%'`。当前程序启动时执行 `CREATE TABLE IF NOT EXISTS`，因此账号需要 `CREATE`。1.6.3-mysql 从旧库升级时会在 MySQL `GET_LOCK` 保护下补充兼容字段和索引，需要一次性 `ALTER`；测试库升级验证完成后执行 `REVOKE ALTER ON consulting_requirement_manager.* FROM 'crm_user'@'10.0.%';`。不需要 `DROP`、`GRANT OPTION` 或全库权限。
 
 ## 3. 网络和 TLS
 
@@ -192,7 +196,8 @@ gunzip -c /backup/crm_2026-07-10_020000.sql.gz \
 - 3306 仅内网/VPN可达，TLS CA 校验通过。
 - `CRM_REQUIRE_TLS=1`，健康检查返回非空 `tls_cipher`。
 - 数据库密码和 OSS 凭据未写入仓库或备份 ZIP。
-- 首个管理员已改密，角色账号权限已逐一核验。
+- 至少两个管理员已改密，账号预建、角色调整、忘记密码重置和强制下线流程已核验。
+- 两个客户端登录同一账号时，后登录能替换前会话，且旧客户端退出不影响新会话。
 - 两客户端并发预算、冻结和审批测试通过。
 - MySQL 和附件联合恢复演练通过。
 - 磁盘、连接数、慢查询、备份失败和 OSS 异常已有监控告警。
