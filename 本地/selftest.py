@@ -12,6 +12,15 @@ def assert_true(condition, message):
         raise AssertionError(message)
 
 
+def button_texts(widget):
+    labels = []
+    for child in widget.winfo_children():
+        if child.winfo_class() in {"TButton", "Button"}:
+            labels.append(str(child.cget("text")))
+        labels.extend(button_texts(child))
+    return labels
+
+
 def contrast_ratio(foreground, background):
     def luminance(value):
         channels = [int(value[index:index + 2], 16) / 255 for index in (1, 3, 5)]
@@ -56,6 +65,124 @@ def assert_critical_error_routing():
                 os.environ.pop("CRM_LOG_LEVEL", None)
             else:
                 os.environ["CRM_LOG_LEVEL"] = old_level
+
+
+def test_fresh_database_initialization():
+    business_tables = [
+        "planning_projects",
+        "annual_plans",
+        "implementation_versions",
+        "requirements",
+        "budget_flows",
+        "funding_applications",
+        "artifacts",
+        "operation_records",
+        "change_requests",
+        "change_request_payloads",
+        "requirement_status_history",
+        "version_baselines",
+        "version_baseline_requirements",
+        "version_baseline_artifacts",
+        "task_effort_entries",
+        "dashboard_preferences",
+        "operation_logs",
+    ]
+    default_tags = {
+        "业务痛点",
+        "功能优化",
+        "运维 Bug",
+        "招投标要求",
+        "验收整改",
+        "客户新增",
+        "版本必做",
+        "待确认",
+    }
+    old_seed_demo = os.environ.pop("CRM_SEED_DEMO_DATA", None)
+    db = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="crm-fresh-database-selftest-") as temp_dir:
+            base_dir = Path(temp_dir) / "application"
+            data_dir = Path(temp_dir) / "data"
+            base_dir.mkdir()
+            try:
+                db = app.Database(base_dir, data_dir=data_dir)
+                tables = {
+                    row["name"]
+                    for row in db.query("SELECT name FROM sqlite_master WHERE type='table'")
+                }
+                assert_true(set(business_tables).issubset(tables), "首次启动未创建完整业务表结构")
+                for table in business_tables:
+                    row_count = db.one(f"SELECT COUNT(*) AS count FROM {table}")["count"]
+                    assert_true(row_count == 0, f"首次启动不应预置业务数据：{table}")
+                users = db.query("SELECT username, display_name, role_name, is_active FROM users")
+                assert_true(len(users) == 1 and users[0]["username"] == "admin" and
+                            users[0]["display_name"] == "默认管理员" and
+                            users[0]["role_name"] == "管理员" and users[0]["is_active"] == 1,
+                            "首次启动只能初始化一个可用的本地默认管理员")
+                tags = db.query("SELECT tag_name, is_active FROM tag_definitions")
+                assert_true(len(tags) == 8 and {row["tag_name"] for row in tags} == default_tags and
+                            all(row["is_active"] == 1 for row in tags),
+                            "首次启动必须且只能初始化 8 个可用基础标签")
+                audit_lines = [
+                    line for line in (db.logs_dir / "audit.log").read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                assert_true(audit_lines == [], "首次启动不应生成虚假的业务审计事件")
+                assert_true(db.db_path == data_dir / "app.db", "本地数据库未保存在安装路径 data 目录")
+            finally:
+                if db is not None:
+                    db.close()
+                    db = None
+                app.close_logging()
+    finally:
+        if db is not None:
+            db.close()
+        app.close_logging()
+        if old_seed_demo is not None:
+            os.environ["CRM_SEED_DEMO_DATA"] = old_seed_demo
+
+
+def test_packaged_database_never_seeds_demo_data():
+    old_seed_demo = os.environ.get("CRM_SEED_DEMO_DATA")
+    had_frozen = hasattr(app.sys, "frozen")
+    old_frozen = getattr(app.sys, "frozen", None)
+    db = None
+    try:
+        os.environ["CRM_SEED_DEMO_DATA"] = "1"
+        app.sys.frozen = True
+        with tempfile.TemporaryDirectory(prefix="crm-packaged-database-selftest-") as temp_dir:
+            base_dir = Path(temp_dir) / "application"
+            data_dir = Path(temp_dir) / "data"
+            base_dir.mkdir()
+            try:
+                db = app.Database(base_dir, data_dir=data_dir)
+                for table in (
+                    "planning_projects",
+                    "annual_plans",
+                    "implementation_versions",
+                    "requirements",
+                    "budget_flows",
+                    "artifacts",
+                ):
+                    row_count = db.one(f"SELECT COUNT(*) AS count FROM {table}")["count"]
+                    assert_true(row_count == 0, f"正式安装程序不得通过环境变量预置业务数据：{table}")
+            finally:
+                if db is not None:
+                    db.close()
+                    db = None
+                app.close_logging()
+    finally:
+        if db is not None:
+            db.close()
+        app.close_logging()
+        if had_frozen:
+            app.sys.frozen = old_frozen
+        else:
+            delattr(app.sys, "frozen")
+        if old_seed_demo is None:
+            os.environ.pop("CRM_SEED_DEMO_DATA", None)
+        else:
+            os.environ["CRM_SEED_DEMO_DATA"] = old_seed_demo
 
 
 def test_legacy_audit_migration():
@@ -117,18 +244,23 @@ def test_legacy_audit_migration():
             artifact_columns = {row[1] for row in db.query("PRAGMA table_info(artifacts)")}
             baseline_columns = {row[1] for row in db.query("PRAGMA table_info(version_baseline_requirements)")}
             baseline_header_columns = {row[1] for row in db.query("PRAGMA table_info(version_baselines)")}
+            change_columns = {row[1] for row in db.query("PRAGMA table_info(change_requests)")}
             assert_true("current_stage" in project_columns, "旧库未迁移项目当前阶段")
             assert_true(db.one("SELECT current_stage FROM planning_projects LIMIT 1")["current_stage"] == "宏观规划",
                         "旧库项目阶段默认值错误")
             assert_true("parent_requirement_id" in requirement_columns, "旧库未迁移原需求关联")
             assert_true(db.one("SELECT business_key FROM requirements WHERE id=1")["business_key"] == "legacy key",
                         "旧库业务标识未按 trim/lower/折叠空白规则迁移")
-            assert_true({"visibility", "approval_status", "change_request_id"}.issubset(artifact_columns),
-                        "旧库未迁移成果物可见性或审批字段")
+            assert_true({"visibility", "approval_status", "change_request_id", "reviewed_by", "reviewed_at",
+                         "review_note"}.issubset(artifact_columns),
+                        "旧库未迁移成果物可见性或完整审批字段")
             assert_true({"requirement_description", "business_key", "estimated_budget", "estimated_hours",
                          "parent_requirement_id"}.issubset(baseline_columns), "旧库未迁移完整基线字段")
             assert_true({"estimated_hours", "actual_hours"}.issubset(baseline_header_columns),
                         "旧库未迁移基线工时汇总字段")
+            assert_true({"expected_baseline_sequence", "decision_note", "applied_by", "applied_at",
+                         "applied_baseline_id"}.issubset(change_columns),
+                        "旧库未迁移变更基线并发或独立执行字段")
             pending_count = db.one("SELECT COUNT(*) c FROM change_requests WHERE requirement_id=1 AND approval_status='pending'")["c"]
             rejected_count = db.one("SELECT COUNT(*) c FROM change_requests WHERE requirement_id=1 AND approval_status='rejected'")["c"]
             assert_true(pending_count == 1 and rejected_count == 1, "旧库重复待审批变更未安全去重")
@@ -137,6 +269,100 @@ def test_legacy_audit_migration():
             for table in ["funding_applications", "operation_records", "version_baseline_artifacts"]:
                 assert_true(db.one("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)) is not None,
                             f"旧库未创建新表：{table}")
+        finally:
+            if db is not None:
+                db.close()
+            app.close_logging()
+
+
+def test_legacy_approved_change_migration():
+    with tempfile.TemporaryDirectory(prefix="crm-legacy-approved-change-") as temp_dir:
+        base_dir = Path(temp_dir) / "application"
+        data_dir = Path(temp_dir) / "data"
+        base_dir.mkdir()
+        db = None
+        try:
+            db = app.Database(base_dir, data_dir=data_dir)
+            t = app.now_text()
+            project_id = db.execute("""INSERT INTO planning_projects(
+                                          project_code, project_name, total_budget, created_at, updated_at)
+                                       VALUES(?,?,?,?,?)""",
+                                    ("LEGACY-CHANGE", "旧变更迁移项目", 1000, t, t)).lastrowid
+            plan_id = db.execute("""INSERT INTO annual_plans(
+                                       project_id, plan_year, plan_name, annual_budget, created_at, updated_at)
+                                    VALUES(?,?,?,?,?,?)""",
+                                 (project_id, 2026, "旧变更年度", 1000, t, t)).lastrowid
+            version_id = db.execute("""INSERT INTO implementation_versions(
+                                          project_id, annual_plan_id, version_code, version_name,
+                                          version_budget, created_at, updated_at)
+                                       VALUES(?,?,?,?,?,?,?)""",
+                                    (project_id, plan_id, "LEGACY-V1", "旧变更版本", 1000, t, t)).lastrowid
+            requirement_id = db.execute("""INSERT INTO requirements(
+                                              requirement_code, requirement_name, requirement_description,
+                                              business_key, source_role, project_id, annual_plan_id, version_id,
+                                              status, created_at, updated_at)
+                                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                                        ("LEGACY-REQ", "执行前名称", "旧版变更迁移验证", "legacy-change",
+                                         "咨询负责人", project_id, plan_id, version_id, "草稿", t, t)).lastrowid
+            original_baseline = db.freeze_version_with_baseline(version_id, "旧版发布人", t)
+            assert_true(original_baseline["snapshot_no"] == 1, "旧变更迁移夹具初始基线错误")
+            db.execute(
+                "UPDATE requirements SET requirement_name='旧版审批已生效名称', status='变更中', updated_at=? WHERE id=?",
+                (t, requirement_id),
+            )
+            db.conn.execute("DROP INDEX IF EXISTS idx_change_pending_requirement")
+            db.conn.execute("DROP INDEX IF EXISTS idx_change_version_status_baseline")
+            db.conn.execute("ALTER TABLE change_requests RENAME TO change_requests_new_schema")
+            db.conn.execute("""CREATE TABLE change_requests (
+                                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                   version_id INTEGER NOT NULL,
+                                   requirement_id INTEGER,
+                                   change_title TEXT NOT NULL,
+                                   change_reason TEXT,
+                                   impact_scope TEXT,
+                                   approval_status TEXT DEFAULT 'pending',
+                                   requested_by TEXT,
+                                   requested_at TEXT NOT NULL,
+                                   approved_by TEXT,
+                                   approved_at TEXT
+                               )""")
+            change_id = db.conn.execute("""INSERT INTO change_requests(
+                                               version_id, requirement_id, change_title, change_reason,
+                                               approval_status, requested_by, requested_at, approved_by, approved_at)
+                                            VALUES(?,?,?,?,'approved',?,?,?,?)""",
+                                        (version_id, requirement_id, "旧版已批准变更", "旧逻辑批准即生效",
+                                         "旧申请人", t, "旧审批人", t)).lastrowid
+            db.conn.execute(
+                "INSERT INTO change_request_payloads(change_request_id, change_type, proposed_value) VALUES(?,?,?)",
+                (change_id, "update", app.json.dumps({"requirement_name": "旧版审批已生效名称"}, ensure_ascii=False)),
+            )
+            db.conn.execute("DROP TABLE change_requests_new_schema")
+            db.conn.commit()
+            db.close()
+            db = None
+            app.close_logging()
+
+            db = app.Database(base_dir, data_dir=data_dir)
+            migrated = db.one("SELECT * FROM change_requests WHERE id=?", (change_id,))
+            migrated_baseline = db.one(
+                "SELECT snapshot_no FROM version_baselines WHERE id=?", (migrated["applied_baseline_id"],)
+            )
+            migrated_snapshot = db.one("""SELECT requirement_name FROM version_baseline_requirements
+                                           WHERE baseline_id=? AND requirement_id=?""",
+                                       (migrated["applied_baseline_id"], requirement_id))
+            assert_true(migrated["approval_status"] == "applied" and migrated["applied_by"] == "旧审批人" and
+                        migrated["applied_at"] == t and migrated["expected_baseline_sequence"] == 1 and
+                        migrated_baseline and migrated_baseline["snapshot_no"] == 2 and
+                        migrated_snapshot and migrated_snapshot["requirement_name"] == "旧版审批已生效名称",
+                        "旧版已批准即生效变更未迁移为已执行或未生成当前态基线")
+            db.close()
+            db = None
+            app.close_logging()
+
+            db = app.Database(base_dir, data_dir=data_dir)
+            assert_true(db.one("SELECT COUNT(*) c FROM version_baselines WHERE version_id=?", (version_id,))["c"] == 2 and
+                        db.one("SELECT approval_status FROM change_requests WHERE id=?", (change_id,))["approval_status"] == "applied",
+                        "旧版已执行变更迁移重复运行时不幂等")
         finally:
             if db is not None:
                 db.close()
@@ -249,6 +475,16 @@ def test_database_transactions():
             except ValueError:
                 pass
             before_allocated = float(req["allocated_budget"] or 0)
+            assert_true(app.BUDGET_FLOW_TYPES == ("已分配预算", "实际消耗", "调整金额"),
+                        "本地资金流水类型未与远程业务口径保持一致")
+            for unsupported_type in ("计划预算", "冻结金额"):
+                try:
+                    db.record_budget_flow(f"BF-SELFTEST-TYPE-{unsupported_type}", req["project_id"], req["annual_plan_id"],
+                                          req["version_id"], req["id"], unsupported_type, 100,
+                                          "unsupported", "自测", app.now_text())
+                    raise AssertionError(f"已停用资金类型仍可新增：{unsupported_type}")
+                except ValueError as exc:
+                    assert_true("资金类型无效" in str(exc), "停用资金类型拒绝提示异常")
             for flow_type, invalid_amount in (("已分配预算", -1), ("实际消耗", -1), ("调整金额", 0)):
                 try:
                     db.record_budget_flow(f"BF-SELFTEST-AMOUNT-{flow_type}", req["project_id"], req["annual_plan_id"],
@@ -393,7 +629,83 @@ def test_database_transactions():
                 "version_no": "v1", "description": "冻结前已批准成果物", "visibility": "客户可见",
                 "project_id": req["project_id"],
             }, "自测", t)
-            assert_true(approved_artifact["approval_status"] == "approved", "未冻结版本成果物不应进入审批")
+            assert_true(approved_artifact["approval_status"] == "draft", "未冻结版本成果物未保存为草稿")
+            try:
+                db.submit_artifact_for_review(approved_artifact["artifact_id"], "其他上传人", t)
+                raise AssertionError("非上传人可提交成果物审批")
+            except ValueError:
+                pass
+            submitted = db.submit_artifact_for_review(approved_artifact["artifact_id"], "自测", t)
+            assert_true(submitted["approval_status"] == "submitted" and submitted["change_id"] is None,
+                        "未冻结成果物未进入普通审批")
+            try:
+                db.review_artifact(approved_artifact["artifact_id"], True, "越权审批", "自测", t)
+                raise AssertionError("无审批权限可审批成果物")
+            except ValueError:
+                pass
+            assert_true(db.review_artifact(approved_artifact["artifact_id"], True, "可纳入版本基线", "自测", t,
+                                           can_review=True), "成果物审批未成功")
+            reviewed_artifact = db.one(
+                "SELECT approval_status, reviewed_by, reviewed_at, review_note FROM artifacts WHERE id=?",
+                (approved_artifact["artifact_id"],),
+            )
+            assert_true(reviewed_artifact["approval_status"] == "approved" and
+                        reviewed_artifact["reviewed_by"] == "自测" and reviewed_artifact["reviewed_at"] and
+                        reviewed_artifact["review_note"] == "可纳入版本基线", "成果物审批结果字段不完整")
+
+            managed_attachment = db.attachments_dir / "artifact-review-delete.txt"
+            managed_attachment.write_text("artifact selftest", encoding="utf-8")
+            rework_artifact = db.create_artifact_record({
+                "artifact_code": "ART-REVIEW-REWORK", "artifact_name": "审批返工成果物.txt",
+                "artifact_type": "任务清单", "file_path": str(managed_attachment.relative_to(db.data_dir)),
+                "file_ext": ".txt", "file_size": managed_attachment.stat().st_size,
+                "related_object_type": "版本", "related_object_id": req["version_id"],
+                "version_no": "v1", "description": "验证驳回重提", "visibility": "内部",
+                "project_id": req["project_id"],
+            }, "成果上传人", t)
+            db.submit_artifact_for_review(rework_artifact["artifact_id"], "成果上传人", t)
+            db.review_artifact(rework_artifact["artifact_id"], False, "请补充验收依据", "成果审批人", t,
+                               can_review=True)
+            rejected_review = db.one(
+                "SELECT approval_status, reviewed_by, reviewed_at, review_note FROM artifacts WHERE id=?",
+                (rework_artifact["artifact_id"],),
+            )
+            assert_true(rejected_review["approval_status"] == "rejected" and
+                        rejected_review["reviewed_by"] == "成果审批人" and
+                        rejected_review["review_note"] == "请补充验收依据", "成果物驳回信息未保存")
+            resubmitted = db.submit_artifact_for_review(rework_artifact["artifact_id"], "成果上传人", t)
+            reset_review = db.one(
+                "SELECT reviewed_by, reviewed_at, review_note FROM artifacts WHERE id=?",
+                (rework_artifact["artifact_id"],),
+            )
+            assert_true(resubmitted["approval_status"] == "submitted" and
+                        all(reset_review[key] is None for key in ("reviewed_by", "reviewed_at", "review_note")),
+                        "成果物重提未清空旧审批结果")
+            db.review_artifact(rework_artifact["artifact_id"], True, "通过", "成果审批人", t, can_review=True)
+            try:
+                db.delete_artifact_record(rework_artifact["artifact_id"], "普通用户", t)
+                raise AssertionError("非管理角色可删除成果物")
+            except ValueError:
+                pass
+            deleted = db.delete_artifact_record(rework_artifact["artifact_id"], "管理自测", t, can_manage=True)
+            assert_true(not deleted["canceled"] and deleted["attachment_deleted"] and
+                        not managed_attachment.exists() and
+                        db.one("SELECT id FROM artifacts WHERE id=?", (rework_artifact["artifact_id"],)) is None,
+                        "未冻结成果物或受管附件未安全删除")
+
+            external_attachment = Path(temp_dir) / "outside-attachments.txt"
+            external_attachment.write_text("must stay", encoding="utf-8")
+            external_artifact = db.create_artifact_record({
+                "artifact_code": "ART-EXTERNAL-PATH", "artifact_name": "外部路径成果物.txt",
+                "artifact_type": "其他", "file_path": str(external_attachment), "file_ext": ".txt",
+                "file_size": external_attachment.stat().st_size, "related_object_type": "项目",
+                "related_object_id": req["project_id"], "visibility": "内部", "project_id": req["project_id"],
+            }, "自测", t)
+            external_deleted = db.delete_artifact_record(
+                external_artifact["artifact_id"], "管理自测", t, can_manage=True,
+            )
+            assert_true(not external_deleted["attachment_deleted"] and external_attachment.exists(),
+                        "成果物删除越界删除了受管目录外文件")
 
             other_project_id = db.execute("""INSERT INTO planning_projects(
                                                   project_code, project_name, total_budget, created_at, updated_at)
@@ -429,6 +741,27 @@ def test_database_transactions():
                 raise AssertionError("需求变更入口允许非法变更类型")
             except ValueError as exc:
                 assert_true("类型无效" in str(exc), "非法需求变更类型提示异常")
+
+            freeze_blocker = db.create_artifact_record({
+                "artifact_code": "ART-FREEZE-BLOCKER", "artifact_name": "发布前待审批成果物.txt",
+                "artifact_type": "任务清单", "file_path": "attachments/freeze-blocker.txt", "file_ext": ".txt",
+                "file_size": 8, "related_object_type": "版本", "related_object_id": req["version_id"],
+                "version_no": "v1", "description": "验证发布前审批收口", "visibility": "内部",
+                "project_id": req["project_id"],
+            }, "自测", app.now_text())
+            db.submit_artifact_for_review(freeze_blocker["artifact_id"], "自测", app.now_text())
+            try:
+                db.freeze_version_with_baseline(req["version_id"], "自测", app.now_text())
+                raise AssertionError("版本存在待审批成果物时仍可发布")
+            except ValueError as exc:
+                assert_true("待审批成果物" in str(exc), "版本发布待审批拦截提示异常")
+            assert_true(db.one("SELECT is_frozen FROM implementation_versions WHERE id=?",
+                               (req["version_id"],))["is_frozen"] == 0 and
+                        db.one("SELECT id FROM version_baselines WHERE version_id=?", (req["version_id"],)) is None,
+                        "待审批成果物拦截发布后事务未回滚")
+            db.review_artifact(freeze_blocker["artifact_id"], False, "发布前取消", "自测", app.now_text(),
+                               can_review=True)
+            db.delete_artifact_record(freeze_blocker["artifact_id"], "管理自测", app.now_text(), can_manage=True)
 
             baseline = db.freeze_version_with_baseline(req["version_id"], "自测", app.now_text())
             assert_true(baseline and baseline["snapshot_no"] == 1, "版本基线未生成")
@@ -469,8 +802,9 @@ def test_database_transactions():
                                   "实际消耗", 10, "actual", "自测", app.now_text())
 
             t = app.now_text()
-            proposed = dict(req)
-            proposed["requirement_name"] = "统一需求池（已审批）"
+            before_change = db.one("SELECT * FROM requirements WHERE id=?", (req["id"],))
+            proposed = dict(before_change)
+            proposed["requirement_name"] = "统一需求池（已执行）"
             try:
                 db.create_change_request_record(
                     req["version_id"], movable_id, "错配版本变更", "验证需求归属", "需求名称",
@@ -483,8 +817,11 @@ def test_database_transactions():
                 req["version_id"], req["id"], "自测变更", "验证事务", "需求名称",
                 "update", proposed, "自测", t,
             )
-            payload = db.one("SELECT change_type FROM change_request_payloads WHERE change_request_id=?", (change_id,))
-            assert_true(payload and payload["change_type"] == "update", "变更申请与载荷未在同一事务创建")
+            payload = db.one("""SELECT p.change_type, c.expected_baseline_sequence
+                                FROM change_request_payloads p JOIN change_requests c ON c.id=p.change_request_id
+                                WHERE p.change_request_id=?""", (change_id,))
+            assert_true(payload and payload["change_type"] == "update" and payload["expected_baseline_sequence"] == 1,
+                        "变更申请未与载荷及当前基线在同一事务创建")
             try:
                 db.create_change_request_record(
                     req["version_id"], req["id"], "重复变更", "验证单一待审批", "同一需求",
@@ -493,9 +830,52 @@ def test_database_transactions():
                 raise AssertionError("同一需求允许创建多条待审批变更")
             except ValueError:
                 pass
-            db.review_change_request(change_id, "approved", "自测审批人", app.now_text())
+            try:
+                db.review_change_request(change_id, "approved", "自测", app.now_text(), "申请人自审")
+                raise AssertionError("变更申请人可以审批自己的申请")
+            except ValueError as exc:
+                assert_true("不能审批自己的申请" in str(exc), "变更申请自审提示异常")
+            unchanged = db.one("SELECT requirement_name, status FROM requirements WHERE id=?", (req["id"],))
+            assert_true(unchanged["requirement_name"] == before_change["requirement_name"] and
+                        unchanged["status"] == before_change["status"] and
+                        db.one("SELECT approval_status FROM change_requests WHERE id=?", (change_id,))["approval_status"] == "pending" and
+                        db.one("SELECT MAX(snapshot_no) snapshot_no FROM version_baselines WHERE version_id=?",
+                               (req["version_id"],))["snapshot_no"] == 1,
+                        "自审失败后业务、状态或基线未完整回滚")
+            try:
+                db.apply_change_request(change_id, "自测执行人", app.now_text())
+                raise AssertionError("待审批变更可以直接执行")
+            except ValueError:
+                pass
+            db.review_change_request(change_id, "approved", "自测审批人", app.now_text(), "同意调整需求名称")
+            approved = db.one("SELECT * FROM change_requests WHERE id=?", (change_id,))
+            unchanged = db.one("SELECT requirement_name, status FROM requirements WHERE id=?", (req["id"],))
+            assert_true(approved["approval_status"] == "approved" and approved["approved_by"] == "自测审批人" and
+                        approved["decision_note"] == "同意调整需求名称" and
+                        unchanged["requirement_name"] == before_change["requirement_name"] and
+                        unchanged["status"] == before_change["status"] and
+                        db.one("SELECT MAX(snapshot_no) snapshot_no FROM version_baselines WHERE version_id=?",
+                               (req["version_id"],))["snapshot_no"] == 1,
+                        "批准动作修改了业务数据或提前生成基线")
+            applied_baseline = db.apply_change_request(change_id, "自测执行人", app.now_text())
             changed = db.one("SELECT requirement_name, status FROM requirements WHERE id=?", (req["id"],))
-            assert_true(changed["requirement_name"] == "统一需求池（已审批）" and changed["status"] == "变更中", "审批内容未应用")
+            applied = db.one("SELECT * FROM change_requests WHERE id=?", (change_id,))
+            applied_snapshot = db.one("""SELECT requirement_name FROM version_baseline_requirements
+                                         WHERE baseline_id=? AND requirement_id=?""",
+                                      (applied_baseline["baseline_id"], req["id"]))
+            assert_true(changed["requirement_name"] == "统一需求池（已执行）" and changed["status"] == "变更中" and
+                        applied["approval_status"] == "applied" and applied["applied_by"] == "自测执行人" and
+                        applied["applied_baseline_id"] == applied_baseline["baseline_id"] and
+                        applied_baseline["snapshot_no"] == 2 and applied_snapshot["requirement_name"] == "统一需求池（已执行）",
+                        "已批准变更未在执行时生效并生成完整递增基线")
+            try:
+                db.apply_change_request(change_id, "重复执行人", app.now_text())
+                raise AssertionError("同一变更申请可以重复执行")
+            except ValueError:
+                pass
+            assert_true(db.one("SELECT MAX(snapshot_no) snapshot_no FROM version_baselines WHERE version_id=?",
+                               (req["version_id"],))["snapshot_no"] == 2,
+                        "重复执行失败后仍生成了额外基线")
 
             conflicting = dict(db.one("SELECT * FROM requirements WHERE id=?", (child_id,)))
             conflicting["business_key"] = req["business_key"]
@@ -503,21 +883,45 @@ def test_database_transactions():
                 req["version_id"], child_id, "业务标识冲突", "验证审批复核", "业务标识",
                 "update", conflicting, "自测", app.now_text(),
             )
+            db.review_change_request(conflict_change, "approved", "自测审批人", app.now_text(), "批准后执行阶段复核业务约束")
             try:
-                db.review_change_request(conflict_change, "approved", "自测审批人", app.now_text())
-                raise AssertionError("审批未复核同版本业务标识唯一性")
-            except ValueError:
-                pass
-            assert_true(db.one("SELECT approval_status FROM change_requests WHERE id=?", (conflict_change,))["approval_status"] == "pending",
-                        "业务标识冲突审批失败后事务未回滚")
-            db.review_change_request(conflict_change, "rejected", "自测审批人", app.now_text())
+                db.apply_change_request(conflict_change, "自测执行人", app.now_text())
+                raise AssertionError("执行阶段未复核同版本业务标识唯一性")
+            except ValueError as exc:
+                assert_true("业务需求标识不能重复" in str(exc), "执行阶段业务标识冲突提示异常")
+            assert_true(db.one("SELECT approval_status FROM change_requests WHERE id=?", (conflict_change,))["approval_status"] == "approved" and
+                        db.one("SELECT MAX(snapshot_no) snapshot_no FROM version_baselines WHERE version_id=?",
+                               (req["version_id"],))["snapshot_no"] == 2,
+                        "执行校验失败后变更状态或基线未回滚")
+
+            overlap_proposed = dict(db.one("SELECT * FROM requirements WHERE id=?", (child_id,)))
+            overlap_proposed["requirement_name"] = "重叠变更不应获批"
+            overlap_change = db.create_change_request_record(
+                req["version_id"], child_id, "重叠变更", "验证目标重叠", "同一需求",
+                "update", overlap_proposed, "自测", app.now_text(),
+            )
+            try:
+                db.review_change_request(overlap_change, "approved", "另一审批人", app.now_text(), "尝试批准重叠变更")
+                raise AssertionError("同基线的重叠变更可以同时批准")
+            except ValueError as exc:
+                assert_true("重叠" in str(exc), "重叠变更审批提示异常")
+            assert_true(db.one("SELECT approval_status FROM change_requests WHERE id=?", (overlap_change,))["approval_status"] == "pending",
+                        "重叠审批失败后申请状态未回滚")
+            db.review_change_request(overlap_change, "rejected", "另一审批人", app.now_text(), "重叠申请驳回")
+
+            stale_proposed = dict(db.one("SELECT * FROM requirements WHERE id=?", (req["id"],)))
+            stale_proposed["requirement_name"] = "旧基线变更不应获批"
+            stale_change = db.create_change_request_record(
+                req["version_id"], req["id"], "旧基线变更", "验证乐观并发", "需求名称",
+                "update", stale_proposed, "自测", app.now_text(),
+            )
 
             missing_payload = db.execute("""INSERT INTO change_requests(
                                               version_id, change_title, change_reason, approval_status, requested_by, requested_at)
                                             VALUES(?,?,?,'pending',?,?)""",
                                          (req["version_id"], "缺少载荷", "验证载荷必填", "自测", app.now_text())).lastrowid
             try:
-                db.review_change_request(missing_payload, "rejected", "自测审批人", app.now_text())
+                db.review_change_request(missing_payload, "rejected", "自测审批人", app.now_text(), "缺少载荷应失败")
                 raise AssertionError("缺少载荷的变更申请仍可审批")
             except ValueError:
                 pass
@@ -530,21 +934,113 @@ def test_database_transactions():
                 "version_no": "v2", "description": "冻结后新增", "visibility": "内部",
                 "project_id": req["project_id"],
             }, "自测", app.now_text())
-            assert_true(frozen_artifact["approval_status"] == "pending" and frozen_artifact["change_id"],
-                        "冻结版本新增成果物未进入变更审批")
-            db.review_change_request(frozen_artifact["change_id"], "approved", "自测审批人", app.now_text())
-            assert_true(db.one("SELECT approval_status FROM artifacts WHERE id=?", (frozen_artifact["artifact_id"],))["approval_status"] == "approved",
-                        "成果物变更审批通过后未生效")
+            assert_true(frozen_artifact["approval_status"] == "draft" and not frozen_artifact["change_id"],
+                        "冻结版本新增成果物未先保存为草稿")
+            frozen_submission = db.submit_artifact_for_review(
+                frozen_artifact["artifact_id"], "自测", app.now_text(),
+            )
+            assert_true(frozen_submission["approval_status"] == "pending" and frozen_submission["change_id"],
+                        "冻结版本成果物提交时未进入变更审批")
+            db.review_change_request(
+                frozen_submission["change_id"], "approved", "自测审批人", app.now_text(), "同意新增冻结版本成果物"
+            )
+            frozen_approved_row = db.one(
+                "SELECT approval_status, reviewed_by, reviewed_at, review_note FROM artifacts WHERE id=?",
+                (frozen_artifact["artifact_id"],),
+            )
+            assert_true(frozen_approved_row["approval_status"] == "pending" and not frozen_approved_row["reviewed_by"] and
+                        db.one("SELECT approval_status FROM change_requests WHERE id=?",
+                               (frozen_submission["change_id"],))["approval_status"] == "approved" and
+                        db.one("SELECT MAX(snapshot_no) snapshot_no FROM version_baselines WHERE version_id=?",
+                               (req["version_id"],))["snapshot_no"] == 2,
+                        "成果物变更在批准阶段提前生效或生成基线")
+            try:
+                db.delete_artifact_record(frozen_artifact["artifact_id"], "管理自测", app.now_text(), can_manage=True)
+                raise AssertionError("已批准待执行成果物可直接取消")
+            except ValueError as exc:
+                assert_true("等待执行" in str(exc), "待执行成果物取消拒绝提示异常")
+            artifact_baseline = db.apply_change_request(
+                frozen_submission["change_id"], "自测执行人", app.now_text()
+            )
+            frozen_approved_row = db.one(
+                "SELECT approval_status, reviewed_by, reviewed_at, review_note FROM artifacts WHERE id=?",
+                (frozen_artifact["artifact_id"],),
+            )
+            artifact_snapshot = db.one("""SELECT artifact_code FROM version_baseline_artifacts
+                                           WHERE baseline_id=? AND artifact_id=?""",
+                                       (artifact_baseline["baseline_id"], frozen_artifact["artifact_id"]))
+            assert_true(frozen_approved_row["approval_status"] == "approved" and
+                        frozen_approved_row["reviewed_by"] == "自测审批人" and frozen_approved_row["reviewed_at"] and
+                        frozen_approved_row["review_note"] == "同意新增冻结版本成果物" and
+                        artifact_baseline["snapshot_no"] == 3 and artifact_snapshot and
+                        artifact_snapshot["artifact_code"] == "ART-FROZEN-PENDING",
+                        "成果物变更执行后未生效或未进入递增基线")
+            try:
+                db.apply_change_request(conflict_change, "自测执行人", app.now_text())
+                raise AssertionError("旧基线上的已批准变更仍可执行")
+            except ValueError as exc:
+                assert_true("基线已过期" in str(exc), "旧基线执行拦截提示异常")
+            try:
+                db.review_change_request(stale_change, "approved", "另一审批人", app.now_text(), "旧基线审批")
+                raise AssertionError("旧基线上的待审批变更仍可批准")
+            except ValueError as exc:
+                assert_true("基线已过期" in str(exc), "旧基线审批拦截提示异常")
+            db.review_change_request(stale_change, "rejected", "另一审批人", app.now_text(), "基线过期后驳回重提")
+            try:
+                db.delete_artifact_record(frozen_artifact["artifact_id"], "管理自测", app.now_text(), can_manage=True)
+                raise AssertionError("冻结版本已通过成果物可直接删除")
+            except ValueError as exc:
+                assert_true("不能直接删除" in str(exc), "冻结成果物删除拒绝提示异常")
+            assert_true(db.one("SELECT id FROM artifacts WHERE id=?", (frozen_artifact["artifact_id"],)) is not None,
+                        "冻结版本已通过成果物在拒绝删除后丢失")
+
+            pending_attachment = db.attachments_dir / "frozen-pending-cancel.txt"
+            pending_attachment.write_text("pending", encoding="utf-8")
+            pending_cancel = db.create_artifact_record({
+                "artifact_code": "ART-FROZEN-CANCEL", "artifact_name": "待审批取消.txt",
+                "artifact_type": "任务书方案", "file_path": str(pending_attachment.relative_to(db.data_dir)),
+                "file_ext": ".txt", "file_size": pending_attachment.stat().st_size,
+                "related_object_type": "版本", "related_object_id": req["version_id"],
+                "version_no": "v2", "description": "待审批取消", "visibility": "内部",
+                "project_id": req["project_id"],
+            }, "自测", app.now_text())
+            pending_cancel_submission = db.submit_artifact_for_review(
+                pending_cancel["artifact_id"], "自测", app.now_text(),
+            )
+            pending_cancel_result = db.delete_artifact_record(
+                pending_cancel["artifact_id"], "管理自测", app.now_text(), can_manage=True,
+            )
+            assert_true(pending_cancel_result["canceled"] and pending_cancel_result["attachment_deleted"] and
+                        not pending_attachment.exists() and
+                        db.one("SELECT id FROM artifacts WHERE id=?", (pending_cancel["artifact_id"],)) is None and
+                        db.one("SELECT approval_status FROM change_requests WHERE id=?",
+                               (pending_cancel_submission["change_id"],))["approval_status"] == "rejected",
+                        "冻结范围待审批成果物未安全取消")
+
+            rejected_attachment = db.attachments_dir / "frozen-rejected-cancel.txt"
+            rejected_attachment.write_text("rejected", encoding="utf-8")
             rejected_artifact = db.create_artifact_record({
                 "artifact_code": "ART-FROZEN-REJECTED", "artifact_name": "驳回成果物.txt",
-                "artifact_type": "任务书方案", "file_path": "attachments/rejected.txt", "file_ext": ".txt",
-                "file_size": 8, "related_object_type": "版本", "related_object_id": req["version_id"],
+                "artifact_type": "任务书方案", "file_path": str(rejected_attachment.relative_to(db.data_dir)),
+                "file_ext": ".txt", "file_size": rejected_attachment.stat().st_size,
+                "related_object_type": "版本", "related_object_id": req["version_id"],
                 "version_no": "v3", "description": "审批驳回", "visibility": "内部",
                 "project_id": req["project_id"],
             }, "自测", app.now_text())
-            db.review_change_request(rejected_artifact["change_id"], "rejected", "自测审批人", app.now_text())
-            assert_true(db.one("SELECT approval_status FROM artifacts WHERE id=?", (rejected_artifact["artifact_id"],))["approval_status"] == "rejected",
+            rejected_submission = db.submit_artifact_for_review(
+                rejected_artifact["artifact_id"], "自测", app.now_text(),
+            )
+            db.review_change_request(
+                rejected_submission["change_id"], "rejected", "自测审批人", app.now_text(), "成果物不符合交付要求"
+            )
+            assert_true(db.one("SELECT approval_status, reviewed_by, review_note FROM artifacts WHERE id=?",
+                               (rejected_artifact["artifact_id"],))["approval_status"] == "rejected",
                         "成果物变更驳回后状态错误")
+            rejected_cancel = db.delete_artifact_record(
+                rejected_artifact["artifact_id"], "管理自测", app.now_text(), can_manage=True,
+            )
+            assert_true(rejected_cancel["canceled"] and rejected_cancel["attachment_deleted"] and
+                        not rejected_attachment.exists(), "冻结范围已驳回成果物未允许取消")
 
             funding_id = db.execute("""INSERT INTO funding_applications(
                                          application_code, project_id, annual_plan_id, amount, status,
@@ -552,13 +1048,70 @@ def test_database_transactions():
                                        VALUES(?,?,?,?,?,?,?,?,?)""",
                                     ("FUND-SELFTEST", req["project_id"], req["annual_plan_id"], 50000, "草稿",
                                      "销售自测", "年度资金申报", t, t)).lastrowid
-            funding_status = "草稿"
-            for next_status in ["已提交", "审批中", "已批复", "已拨付"]:
-                assert_true(db.transition_funding_application(funding_id, funding_status, next_status, "自测", app.now_text()),
-                            f"资金申报状态未流转到 {next_status}")
+            for invalid_amount in (0, -1, 0.004, float("nan"), float("inf")):
+                try:
+                    db.update_funding_application(funding_id, invalid_amount, "非法金额", "销售自测", app.now_text())
+                    raise AssertionError(f"非法资金申报金额可保存：{invalid_amount}")
+                except ValueError:
+                    pass
+            try:
+                db.update_funding_application(funding_id, 51000, "越权编辑", "其他销售", app.now_text())
+                raise AssertionError("非申请人可编辑资金申报")
+            except ValueError:
+                pass
+            assert_true(db.update_funding_application(
+                funding_id, 52000.126, "草稿修改", "销售自测", app.now_text(),
+            ), "草稿资金申报未允许编辑")
+            funding_update_log = db.one("""SELECT before_value, after_value FROM operation_logs
+                                           WHERE object_type='funding_application' AND object_id=?
+                                             AND operation_type='update' ORDER BY id DESC LIMIT 1""", (funding_id,))
+            funding_before = app.json.loads(funding_update_log["before_value"])
+            funding_after = app.json.loads(funding_update_log["after_value"])
+            assert_true(funding_before["amount"] == 50000 and funding_after["amount"] == 52000.13 and
+                        funding_after["description"] == "草稿修改", "资金申报编辑审计未记录金额/说明前后值")
+
+            assert_true(db.transition_funding_application(
+                funding_id, "草稿", "已提交", "销售自测", app.now_text(),
+            ), "资金申报草稿未提交")
+            try:
+                db.update_funding_application(funding_id, 53000, "提交后修改", "销售自测", app.now_text())
+                raise AssertionError("已提交资金申报仍可编辑")
+            except ValueError as exc:
+                assert_true("只能编辑" in str(exc), "资金申报锁定状态错误提示异常")
+            assert_true(db.transition_funding_application(
+                funding_id, "已提交", "审批中", "审批自测", app.now_text(),
+            ), "资金申报未进入审批")
+            assert_true(db.transition_funding_application(
+                funding_id, "审批中", "已驳回", "审批自测", app.now_text(),
+            ), "资金申报未能驳回")
+            assert_true(db.update_funding_application(
+                funding_id, 53000, "驳回后补充说明", "销售自测", app.now_text(),
+            ), "已驳回资金申报未允许编辑")
+            try:
+                db.transition_funding_application(funding_id, "已驳回", "已提交", "其他销售", app.now_text())
+                raise AssertionError("非申请人可重新提交资金申报")
+            except ValueError:
+                pass
+            assert_true(db.transition_funding_application(
+                funding_id, "已驳回", "已提交", "销售自测", app.now_text(),
+            ), "已驳回资金申报未允许重新提交")
+            resubmitted_funding = db.one(
+                "SELECT amount, description, status, submitted_at, reviewed_by, reviewed_at FROM funding_applications WHERE id=?",
+                (funding_id,),
+            )
+            assert_true(float(resubmitted_funding["amount"]) == 53000 and
+                        resubmitted_funding["description"] == "驳回后补充说明" and
+                        resubmitted_funding["status"] == "已提交" and resubmitted_funding["submitted_at"] and
+                        resubmitted_funding["reviewed_by"] is None and resubmitted_funding["reviewed_at"] is None,
+                        "资金申报重提未保留编辑值或清空旧审批信息")
+            funding_status = "已提交"
+            for next_status in ["审批中", "已批复", "已拨付"]:
+                assert_true(db.transition_funding_application(
+                    funding_id, funding_status, next_status, "审批自测", app.now_text(),
+                ), f"资金申报状态未流转到 {next_status}")
                 funding_status = next_status
-            assert_true(db.one("SELECT status, submitted_at, reviewed_by FROM funding_applications WHERE id=?", (funding_id,))["status"] == "已拨付",
-                        "资金申报未完成全流程")
+            assert_true(db.one("SELECT status FROM funding_applications WHERE id=?", (funding_id,))["status"] == "已拨付",
+                        "资金申报未完成重提后的全流程")
 
             invalid_operation = {
                 "record_code": "OPS-SELFTEST-MISMATCH", "project_id": req["project_id"],
@@ -675,6 +1228,7 @@ def run_checks():
     app.App.reload_page(reload_harness)
     assert_true(reload_calls == ["baseline", "compare"], "特殊版本页面换肤后跳转错误")
     test_legacy_audit_migration()
+    test_legacy_approved_change_migration()
     test_legacy_business_key_conflict_migration()
     test_database_transactions()
     root = None
@@ -931,6 +1485,9 @@ def run_checks():
         assert_true({"funding_create", "funding_submit"}.issubset(app.ROLE_ACTIONS["销售"]),
                     "销售缺少资金申报创建或提交权限")
         assert_true("funding_review" in app.ROLE_ACTIONS["咨询负责人"], "咨询负责人缺少资金审批权限")
+        assert_true({"artifact_review", "artifact_delete"}.issubset(app.ROLE_ACTIONS["项目经理"]) and
+                    "artifact_review" not in app.ROLE_ACTIONS["销售"] and
+                    "artifact_delete" not in app.ROLE_ACTIONS["运营人员"], "成果物审批或删除权限边界错误")
         assert_true("operation_record" in app.ROLE_ACTIONS["运营人员"], "运营人员缺少运营服务维护权限")
         assert_true(app.ARTIFACT_TARGET_TYPES["可研报告"] == {"项目"} and
                     app.ARTIFACT_TARGET_TYPES["分年任务申报书"] == {"年度"} and
@@ -1046,10 +1603,30 @@ def run_checks():
                              applicant_name, description, created_at, updated_at)
                            VALUES(?,?,?,?,?,?,?,?,?)""",
                         ("FUND-UI-SELFTEST", project_id, plan_id, 88000, "已提交", "销售自测", "界面申报", t, t))
+        root.db.execute("""INSERT INTO funding_applications(
+                             application_code, project_id, annual_plan_id, amount, status,
+                             applicant_name, description, created_at, updated_at)
+                           VALUES(?,?,?,?,?,?,?,?,?)""",
+                        ("FUND-UI-EDIT", project_id, plan_id, 66000, "草稿", root.current_user, "编辑前", t, t))
         root.current_role.set("销售")
         root.show_funding_applications()
+        assert_true("编辑申报" in button_texts(root.content), "资金申报页面缺少编辑入口")
         assert_true(any("FUND-UI-SELFTEST" in root.funding_tree.item(item)["values"] for item in root.funding_tree.get_children("")),
                     "资金申报页面未展示当前项目申报")
+        edit_item = next(item for item in root.funding_tree.get_children("")
+                         if "FUND-UI-EDIT" in root.funding_tree.item(item)["values"])
+        root.funding_tree.selection_set(edit_item)
+        original_funding_dialog = app.FieldDialog
+        try:
+            app.FieldDialog = lambda *_args, **_kwargs: type(
+                "FundingEditDialog", (), {"result": {"amount": "67000.55", "description": "界面编辑后"}}
+            )()
+            root.edit_funding_application()
+        finally:
+            app.FieldDialog = original_funding_dialog
+        ui_funding = root.db.one("SELECT amount, description FROM funding_applications WHERE application_code='FUND-UI-EDIT'")
+        assert_true(float(ui_funding["amount"]) == 67000.55 and ui_funding["description"] == "界面编辑后",
+                    "资金申报编辑界面未保存金额或说明")
         root.db.execute("""INSERT INTO operation_records(
                              record_code, project_id, version_id, requirement_id, record_type, status,
                              record_date, owner_name, description, result, created_by, created_at, updated_at)
@@ -1062,15 +1639,17 @@ def run_checks():
                     "运营服务页面未展示当前项目记录")
         root.current_role.set("管理员")
         root.db.execute("""INSERT INTO artifacts(artifact_code, artifact_name, artifact_type, file_path,
-                                                  related_object_type, related_object_id, uploaded_by, uploaded_at, created_at)
-                           VALUES(?,?,?,?,?,?,?,?,?)""",
+                                                  related_object_type, related_object_id, approval_status,
+                                                  uploaded_by, uploaded_at, created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?)""",
                         ("ART-SELFTEST-YEAR", "年度成果物", "分年任务申报书", "attachments/year.txt",
-                         "年度", plan_id, "自测", t, t))
+                         "年度", plan_id, "approved", "自测", t, t))
         root.db.execute("""INSERT INTO artifacts(artifact_code, artifact_name, artifact_type, file_path,
-                                                  related_object_type, related_object_id, uploaded_by, uploaded_at, created_at)
-                           VALUES(?,?,?,?,?,?,?,?,?)""",
+                                                  related_object_type, related_object_id, approval_status,
+                                                  uploaded_by, uploaded_at, created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?)""",
                         ("ART-SELFTEST-LEGACY-YEAR", "旧年度成果物", "分年任务申报书", "attachments/legacy-year.txt",
-                         "年度计划", plan_id, "自测", t, t))
+                         "年度计划", plan_id, "approved", "自测", t, t))
         assert_true(root.artifact_rows_for_context(None, plan_id, version_id) == [], "未选择项目时成果物列表泄露全局数据")
         context_artifact_codes = {row["artifact_code"] for row in root.artifact_rows_for_context(project_id, plan_id, version_id)}
         assert_true({"ART-SELFTEST-YEAR", "ART-SELFTEST-LEGACY-YEAR"}.issubset(context_artifact_codes),
@@ -1122,13 +1701,56 @@ def run_checks():
             "description": "验证普通列表只显示已批准成果物", "visibility": "客户可见",
             "project_id": project_id,
         }, "自测", app.now_text())
-        assert_true(pending_artifact["approval_status"] == "pending", "冻结版本成果物未进入 pending")
+        assert_true(pending_artifact["approval_status"] == "draft", "冻结版本成果物未先保存为草稿")
+        pending_submission = root.db.submit_artifact_for_review(
+            pending_artifact["artifact_id"], "自测", app.now_text(),
+        )
+        assert_true(pending_submission["approval_status"] == "pending", "冻结版本成果物提交后未进入 pending")
         pending_codes = {row["artifact_code"] for row in root.artifact_rows_for_context(project_id, plan_id, version_id)}
-        assert_true("ART-UI-PENDING" not in pending_codes, "普通成果物列表显示了 pending 成果物")
-        assert_true("新增成果物" in root.change_payload_summary(pending_artifact["change_id"]), "变更申请摘要未展示成果物")
-        root.db.review_change_request(pending_artifact["change_id"], "approved", "审批自测", app.now_text())
-        approved_codes = {row["artifact_code"] for row in root.artifact_rows_for_context(project_id, plan_id, version_id)}
-        assert_true("ART-UI-PENDING" in approved_codes, "成果物审批通过后普通列表仍不可见")
+        assert_true("ART-UI-PENDING" in pending_codes, "内部成果物列表未展示待审批状态")
+        root.show_artifacts()
+        assert_true("approval_status_label" in root.artifact_tree["columns"] and
+                    any("变更待审批" in root.artifact_tree.item(item)["values"]
+                        for item in root.artifact_tree.get_children("")), "成果物界面未展示审批状态")
+        admin_artifact_actions = set(button_texts(root.content))
+        assert_true({"提交审批", "审批通过", "审批驳回", "删除/取消"}.issubset(admin_artifact_actions),
+                    "管理角色成果物操作入口不完整")
+        assert_true("新增成果物" in root.change_payload_summary(pending_submission["change_id"]), "变更申请摘要未展示成果物")
+        root.current_role.set("客户")
+        root.show_artifacts()
+        customer_artifact_actions = set(button_texts(root.content))
+        assert_true(not ({"提交审批", "审批通过", "审批驳回", "删除/取消"} & customer_artifact_actions),
+                    "客户成果物页面暴露了维护或审批入口")
+        customer_pending_codes = {row["artifact_code"] for row in root.artifact_rows_for_context(project_id, plan_id, version_id)}
+        assert_true("ART-UI-PENDING" not in customer_pending_codes, "客户看到了未审批成果物")
+        root.current_role.set("管理员")
+        root.db.review_change_request(
+            pending_submission["change_id"], "approved", "审批自测", app.now_text(), "同意新增任务清单"
+        )
+        root.show_artifacts()
+        assert_true(any("变更已批准，待执行" in root.artifact_tree.item(item)["values"]
+                        for item in root.artifact_tree.get_children("")),
+                    "成果物页面未明确显示变更已批准待执行状态")
+        root.current_role.set("客户")
+        customer_approved_not_applied = {
+            row["artifact_code"] for row in root.artifact_rows_for_context(project_id, plan_id, version_id)
+        }
+        assert_true("ART-UI-PENDING" not in customer_approved_not_applied,
+                    "成果物变更仅批准尚未执行时已对客户可见")
+        root.current_role.set("管理员")
+        root.show_settings()
+        change_actions = set(button_texts(root.content))
+        assert_true({"批准", "驳回", "执行变更"}.issubset(change_actions), "变更申请三段式操作入口不完整")
+        assert_true({"approval_status_label", "baseline_context", "applied_by", "applied_at",
+                     "applied_baseline_sequence"}.issubset(set(root.change_tree["columns"])),
+                    "变更申请列表缺少状态、基线或执行信息")
+        assert_true(any("已批准，待执行" in root.change_tree.item(item)["values"]
+                        for item in root.change_tree.get_children("")),
+                    "变更申请列表未明确显示已批准待执行状态")
+        applied_ui_baseline = root.db.apply_change_request(
+            pending_submission["change_id"], "执行自测", app.now_text()
+        )
+        assert_true(applied_ui_baseline["snapshot_no"] == 2, "界面场景成果物执行未生成递增基线")
         root.current_role.set("客户")
         customer_codes = {row["artifact_code"] for row in root.artifact_rows_for_context(project_id, plan_id, version_id)}
         assert_true("ART-UI-PENDING" in customer_codes and "ART-SELFTEST-YEAR" not in customer_codes,
@@ -1181,6 +1803,8 @@ def run_checks():
 
 
 def main():
+    test_fresh_database_initialization()
+    test_packaged_database_never_seeds_demo_data()
     old_data_dir = os.environ.get("CRM_DATA_DIR")
     old_seed_demo = os.environ.get("CRM_SEED_DEMO_DATA")
     with tempfile.TemporaryDirectory(prefix="crm-ui-selftest-") as temp_dir:

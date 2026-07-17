@@ -42,10 +42,10 @@ STATUS_TRANSITIONS = {
 }
 ROLE_ACTIONS = {
     "管理员": {"*"},
-    "咨询负责人": {"project", "plan", "version", "requirement_create", "requirement_edit", "requirement_delete", "requirement_assign", "status", "budget", "artifact", "approve", "export", "effort", "funding_review", "operation_record"},
+    "咨询负责人": {"project", "plan", "version", "requirement_create", "requirement_edit", "requirement_delete", "requirement_assign", "status", "budget", "artifact", "artifact_review", "artifact_delete", "approve", "export", "effort", "funding_review", "operation_record"},
     "客户": {"requirement_create"},
     "销售": {"requirement_create", "artifact", "export", "funding_create", "funding_submit"},
-    "项目经理": {"requirement_create", "requirement_edit", "status", "budget", "artifact", "export", "effort"},
+    "项目经理": {"requirement_create", "requirement_edit", "status", "budget", "artifact", "artifact_review", "artifact_delete", "export", "effort"},
     "研发人员": {"requirement_create", "requirement_edit", "status", "artifact", "task_claim", "effort", "export"},
     "运营人员": {"requirement_create", "requirement_edit", "status", "artifact", "export", "operation_record"},
 }
@@ -192,10 +192,11 @@ FUNDING_TRANSITIONS = {
     "已提交": ["审批中"],
     "审批中": ["已批复", "已驳回"],
     "已批复": ["已拨付"],
-    "已驳回": [],
+    "已驳回": ["已提交"],
     "已拨付": [],
 }
 OPERATION_TYPES = ["推广活动", "线上问题", "维护记录", "问题解答", "功能建议"]
+BUDGET_FLOW_TYPES = ("已分配预算", "实际消耗", "调整金额")
 OPERATION_STATUSES = ["待处理", "处理中", "已完成", "已关闭"]
 ARTIFACT_TARGET_TYPES = {
     "可研报告": {"项目"},
@@ -214,6 +215,19 @@ ARTIFACT_TARGET_TYPES = {
 DANGEROUS_ARTIFACT_EXTENSIONS = {
     ".exe", ".com", ".bat", ".cmd", ".ps1", ".psm1", ".msi", ".msp", ".scr", ".dll",
     ".jar", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".hta", ".lnk", ".reg",
+}
+ARTIFACT_APPROVAL_LABELS = {
+    "draft": "草稿",
+    "submitted": "待审批",
+    "pending": "变更待审批",
+    "approved": "已通过",
+    "rejected": "已驳回",
+}
+CHANGE_STATUS_LABELS = {
+    "pending": "待审批",
+    "approved": "已批准，待执行",
+    "rejected": "已驳回",
+    "applied": "已执行",
 }
 LOGGER = logging.getLogger("consulting_requirement.runtime")
 AUDIT_LOGGER = logging.getLogger("consulting_requirement.audit")
@@ -521,6 +535,8 @@ class Database:
                            flow_type, amount, description, operator_name, occurred_at, allow_actual_overrun=False):
         try:
             self.conn.execute("BEGIN IMMEDIATE")
+            if flow_type not in BUDGET_FLOW_TYPES:
+                raise ValueError("资金类型无效，只能登记已分配预算、实际消耗或调整金额。")
             amount = float(amount or 0)
             if not math.isfinite(amount):
                 raise ValueError("资金金额必须是有限数值。")
@@ -536,8 +552,7 @@ class Database:
                 raise ValueError("关联版本不存在。")
             if version and version["is_frozen"] and flow_type != "实际消耗":
                 raise ValueError("版本已冻结，只允许继续登记实际消耗；预算分配或调整需在冻结前完成。")
-            linked_types = {"已分配预算", "实际消耗", "调整金额"}
-            if flow_type in linked_types:
+            if flow_type in BUDGET_FLOW_TYPES:
                 if not requirement_id:
                     raise ValueError(f"资金类型“{flow_type}”必须关联具体需求。")
                 req = self.conn.execute("SELECT * FROM requirements WHERE id=? AND is_deleted=0", (requirement_id,)).fetchone()
@@ -677,6 +692,13 @@ class Database:
                 raise ValueError("关联版本不存在。")
             if not version["is_frozen"]:
                 raise ValueError("目标版本尚未冻结，请直接编辑需求。")
+            baseline = self.conn.execute(
+                "SELECT COALESCE(MAX(snapshot_no),0) snapshot_no FROM version_baselines WHERE version_id=?",
+                (version_id,),
+            ).fetchone()
+            expected_baseline_sequence = int(baseline["snapshot_no"] or 0)
+            if expected_baseline_sequence < 1:
+                raise ValueError("冻结版本缺少有效基线，不能提交变更申请。")
             requirement = self.conn.execute(
                 "SELECT id, version_id FROM requirements WHERE id=? AND is_deleted=0", (requirement_id,)
             ).fetchone()
@@ -689,10 +711,10 @@ class Database:
                 raise ValueError(f"该需求已有待审批变更 #{pending['id']}，请先完成审批。")
             cur = self.conn.execute("""INSERT INTO change_requests(
                                          version_id, requirement_id, change_title, change_reason, impact_scope,
-                                         approval_status, requested_by, requested_at)
-                                       VALUES(?,?,?,?,?,'pending',?,?)""",
+                                         expected_baseline_sequence, approval_status, requested_by, requested_at)
+                                       VALUES(?,?,?,?,?,?,'pending',?,?)""",
                                     (version_id, requirement_id, title.strip(), reason.strip(), impact_scope,
-                                     requester, occurred_at))
+                                     expected_baseline_sequence, requester, occurred_at))
             change_id = cur.lastrowid
             payload_value = json.dumps(proposed if proposed is not None else {}, ensure_ascii=False)
             self.conn.execute("INSERT INTO change_request_payloads(change_request_id, change_type, proposed_value) VALUES(?,?,?)",
@@ -711,6 +733,50 @@ class Database:
             log_transaction_exception("create_change_request", exc)
             raise
 
+    def _artifact_target_version(self, object_type, object_id):
+        if object_type == "版本":
+            return self.conn.execute(
+                "SELECT id, is_frozen FROM implementation_versions WHERE id=?", (object_id,)
+            ).fetchone()
+        if object_type == "需求":
+            return self.conn.execute("""SELECT v.id, v.is_frozen
+                                        FROM requirements r
+                                        JOIN implementation_versions v ON v.id=r.version_id
+                                        WHERE r.id=? AND r.is_deleted=0""", (object_id,)).fetchone()
+        return None
+
+    def _create_artifact_change_request(self, artifact_id, artifact_name, description, object_type,
+                                        object_id, version_id, requirement_id, operator_name, occurred_at):
+        if not version_id:
+            raise ValueError("冻结成果物缺少关联版本，不能创建变更申请。")
+        baseline = self.conn.execute(
+            "SELECT COALESCE(MAX(snapshot_no),0) snapshot_no FROM version_baselines WHERE version_id=?",
+            (version_id,),
+        ).fetchone()
+        expected_baseline_sequence = int(baseline["snapshot_no"] or 0)
+        if expected_baseline_sequence < 1:
+            raise ValueError("冻结版本缺少有效基线，不能提交成果物变更。")
+        if requirement_id:
+            pending = self.conn.execute(
+                "SELECT id FROM change_requests WHERE requirement_id=? AND approval_status='pending'", (requirement_id,)
+            ).fetchone()
+            if pending:
+                raise ValueError(f"该需求已有待审批变更 #{pending['id']}，请先完成审批。")
+        change = self.conn.execute("""INSERT INTO change_requests(
+                                        version_id, requirement_id, change_title, change_reason, impact_scope,
+                                        expected_baseline_sequence, approval_status, requested_by, requested_at)
+                                      VALUES(?,?,?,?,?,?,'pending',?,?)""",
+                                   (version_id, requirement_id, f"新增成果物：{artifact_name}",
+                                    description or "冻结版本新增成果物",
+                                    f"{object_type} #{object_id}", expected_baseline_sequence,
+                                    operator_name, occurred_at))
+        change_id = change.lastrowid
+        self.conn.execute(
+            "INSERT INTO change_request_payloads(change_request_id, change_type, proposed_value) VALUES(?,?,?)",
+            (change_id, "artifact_add", json.dumps({"artifact_id": artifact_id}, ensure_ascii=False)),
+        )
+        return change_id
+
     def create_artifact_record(self, values, operator_name, occurred_at):
         try:
             self.conn.execute("BEGIN IMMEDIATE")
@@ -727,44 +793,35 @@ class Database:
                 raise ValueError("不允许挂载可执行或脚本文件。")
             if values.get("visibility", "内部") not in {"内部", "客户可见"}:
                 raise ValueError("成果物可见范围无效。")
-            version_id = None
-            requirement_id = None
             if object_type == "项目":
                 row = self.conn.execute("SELECT id FROM planning_projects WHERE id=?", (object_id,)).fetchone()
                 if not row:
                     raise ValueError("关联项目不存在。")
                 target_project_id = row["id"]
-                frozen = False
             elif object_type == "年度":
                 row = self.conn.execute("SELECT id, project_id FROM annual_plans WHERE id=?", (object_id,)).fetchone()
                 if not row:
                     raise ValueError("关联年度计划不存在。")
                 target_project_id = row["project_id"]
-                frozen = False
             elif object_type == "版本":
                 row = self.conn.execute(
-                    "SELECT id, project_id, is_frozen FROM implementation_versions WHERE id=?", (object_id,)
+                    "SELECT id, project_id FROM implementation_versions WHERE id=?", (object_id,)
                 ).fetchone()
                 if not row:
                     raise ValueError("关联版本不存在。")
-                version_id = row["id"]
                 target_project_id = row["project_id"]
-                frozen = bool(row["is_frozen"])
             elif object_type == "需求":
-                row = self.conn.execute("""SELECT r.id, r.project_id, r.version_id, COALESCE(v.is_frozen,0) is_frozen
-                                           FROM requirements r LEFT JOIN implementation_versions v ON v.id=r.version_id
+                row = self.conn.execute("""SELECT r.id, r.project_id
+                                           FROM requirements r
                                            WHERE r.id=? AND r.is_deleted=0""", (object_id,)).fetchone()
                 if not row:
                     raise ValueError("关联需求不存在。")
-                requirement_id = row["id"]
                 target_project_id = row["project_id"]
-                version_id = row["version_id"]
-                frozen = bool(row["is_frozen"])
             else:
                 raise ValueError("成果物挂载对象类型无效。")
             if target_project_id != expected_project_id:
                 raise ValueError("成果物挂载对象不属于当前项目。")
-            approval_status = "pending" if frozen else "approved"
+            approval_status = "draft"
             cur = self.conn.execute("""INSERT INTO artifacts(
                                          artifact_code, artifact_name, artifact_type, file_path, file_ext, file_size,
                                          related_object_type, related_object_id, version_no, description, visibility,
@@ -776,24 +833,6 @@ class Database:
                                      operator_name, occurred_at, occurred_at))
             artifact_id = cur.lastrowid
             change_id = None
-            if approval_status == "pending":
-                if requirement_id:
-                    pending = self.conn.execute(
-                        "SELECT id FROM change_requests WHERE requirement_id=? AND approval_status='pending'", (requirement_id,)
-                    ).fetchone()
-                    if pending:
-                        raise ValueError(f"该需求已有待审批变更 #{pending['id']}，请先完成审批。")
-                change = self.conn.execute("""INSERT INTO change_requests(
-                                                version_id, requirement_id, change_title, change_reason, impact_scope,
-                                                approval_status, requested_by, requested_at)
-                                              VALUES(?,?,?,?,?,'pending',?,?)""",
-                                           (version_id, requirement_id, f"新增成果物：{values['artifact_name']}",
-                                            values.get("description") or "冻结版本新增成果物",
-                                            f"{object_type} #{object_id}", operator_name, occurred_at))
-                change_id = change.lastrowid
-                self.conn.execute("INSERT INTO change_request_payloads(change_request_id, change_type, proposed_value) VALUES(?,?,?)",
-                                  (change_id, "artifact_add", json.dumps({"artifact_id": artifact_id}, ensure_ascii=False)))
-                self.conn.execute("UPDATE artifacts SET change_request_id=? WHERE id=?", (change_id, artifact_id))
             event_id = new_event_id()
             self.conn.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
                                                               operation_type, before_value, after_value, description,
@@ -809,23 +848,253 @@ class Database:
             log_transaction_exception("create_artifact", exc)
             raise
 
+    def submit_artifact_for_review(self, artifact_id, operator_name, occurred_at, can_manage=False):
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            artifact = self.conn.execute("SELECT * FROM artifacts WHERE id=?", (artifact_id,)).fetchone()
+            if not artifact:
+                raise ValueError("成果物不存在。")
+            if artifact["uploaded_by"] != operator_name and not can_manage:
+                raise ValueError("只有上传人或项目管理角色可以提交成果物。")
+            if artifact["approval_status"] not in {"draft", "rejected"}:
+                raise ValueError("只有草稿或已驳回成果物可以提交审批。")
+            version = self._artifact_target_version(
+                artifact["related_object_type"], artifact["related_object_id"]
+            )
+            change_id = None
+            next_status = "submitted"
+            if version and version["is_frozen"]:
+                requirement_id = artifact["related_object_id"] if artifact["related_object_type"] == "需求" else None
+                change_id = self._create_artifact_change_request(
+                    artifact_id, artifact["artifact_name"], artifact["description"],
+                    artifact["related_object_type"], artifact["related_object_id"], version["id"],
+                    requirement_id, operator_name, occurred_at,
+                )
+                next_status = "pending"
+            cur = self.conn.execute("""UPDATE artifacts SET approval_status=?, change_request_id=?,
+                                       reviewed_by=NULL, reviewed_at=NULL, review_note=NULL
+                                       WHERE id=? AND approval_status=?""",
+                                    (next_status, change_id, artifact_id, artifact["approval_status"]))
+            if cur.rowcount != 1:
+                self.conn.rollback()
+                return False
+            event_id = new_event_id()
+            self.conn.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                              operation_type, before_value, after_value, description,
+                                                              event_id, result)
+                                 VALUES(?,?,'artifact',?,'submit',?,?,?,?,'success')""",
+                              (operator_name, occurred_at, artifact_id, artifact["approval_status"], next_status,
+                               "提交成果物审批", event_id))
+            self.conn.commit()
+            audit_event(operator_name, "artifact", artifact_id, "submit", "提交成果物审批", event_id=event_id)
+            return {"approval_status": next_status, "change_id": change_id}
+        except Exception as exc:
+            self.conn.rollback()
+            log_transaction_exception("submit_artifact", exc)
+            raise
+
+    def review_artifact(self, artifact_id, approved, review_note, operator_name, occurred_at, can_review=False):
+        if not can_review:
+            raise ValueError("当前角色无权审批成果物。")
+        next_status = "approved" if approved else "rejected"
+        review_note = str(review_note or "").strip()
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            artifact = self.conn.execute("SELECT * FROM artifacts WHERE id=?", (artifact_id,)).fetchone()
+            if not artifact:
+                raise ValueError("成果物不存在。")
+            if artifact["approval_status"] != "submitted":
+                raise ValueError("只能审批已提交的成果物。")
+            version = self._artifact_target_version(
+                artifact["related_object_type"], artifact["related_object_id"]
+            )
+            if approved and version and version["is_frozen"]:
+                raise ValueError("版本已冻结，待审批成果物不能直接通过；请取消后重新提交以进入变更申请。")
+            cur = self.conn.execute("""UPDATE artifacts SET approval_status=?, reviewed_by=?, reviewed_at=?, review_note=?
+                                       WHERE id=? AND approval_status='submitted'""",
+                                    (next_status, operator_name, occurred_at, review_note, artifact_id))
+            if cur.rowcount != 1:
+                self.conn.rollback()
+                return False
+            event_id = new_event_id()
+            before_value = {"status": artifact["approval_status"]}
+            after_value = {"status": next_status, "review_note": review_note}
+            self.conn.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                              operation_type, before_value, after_value, description,
+                                                              event_id, result)
+                                 VALUES(?,?,'artifact',?,?,?,?,?,?,'success')""",
+                              (operator_name, occurred_at, artifact_id, "approve" if approved else "reject",
+                               json.dumps(before_value, ensure_ascii=False), json.dumps(after_value, ensure_ascii=False),
+                               "成果物审批通过" if approved else "成果物审批驳回", event_id))
+            self.conn.commit()
+            audit_event(operator_name, "artifact", artifact_id, "approve" if approved else "reject",
+                        "成果物审批通过" if approved else "成果物审批驳回", event_id=event_id)
+            return True
+        except Exception as exc:
+            self.conn.rollback()
+            log_transaction_exception("review_artifact", exc)
+            raise
+
+    def _safe_artifact_attachment_path(self, file_path):
+        stored = Path(str(file_path or ""))
+        candidate = stored if stored.is_absolute() else self.data_dir / stored
+        try:
+            if candidate.is_symlink():
+                return None
+            resolved = candidate.resolve()
+            attachments_root = self.attachments_dir.resolve()
+            if resolved.is_file() and resolved.is_relative_to(attachments_root):
+                return candidate
+        except (AttributeError, OSError, RuntimeError):
+            try:
+                if candidate.is_symlink():
+                    return None
+                resolved = candidate.resolve()
+                attachments_root = self.attachments_dir.resolve()
+                if resolved.is_file() and str(resolved).startswith(str(attachments_root) + os.sep):
+                    return candidate
+            except (OSError, RuntimeError):
+                pass
+        return None
+
+    def delete_artifact_record(self, artifact_id, operator_name, occurred_at, can_manage=False):
+        if not can_manage:
+            raise ValueError("当前角色无权删除或取消成果物。")
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            artifact = self.conn.execute("SELECT * FROM artifacts WHERE id=?", (artifact_id,)).fetchone()
+            if not artifact:
+                raise ValueError("成果物不存在。")
+            version = self._artifact_target_version(
+                artifact["related_object_type"], artifact["related_object_id"]
+            )
+            frozen = bool(version and version["is_frozen"])
+            if frozen and artifact["approval_status"] == "approved":
+                raise ValueError("冻结版本中已通过的成果物不能直接删除。")
+            if frozen and artifact["approval_status"] == "pending":
+                if not artifact["change_request_id"]:
+                    raise ValueError("待审批成果物缺少变更申请，不能安全取消。")
+                change = self.conn.execute(
+                    "SELECT approval_status FROM change_requests WHERE id=?", (artifact["change_request_id"],)
+                ).fetchone()
+                if not change:
+                    raise ValueError("成果物关联的变更申请不存在，不能安全取消。")
+                if change["approval_status"] == "approved":
+                    raise ValueError("成果物变更已批准并等待执行，不能直接取消；请先处理该变更申请。")
+                if change["approval_status"] != "pending":
+                    raise ValueError("成果物关联的变更申请已处理，不能按待审批记录取消。")
+                canceled_change = self.conn.execute(
+                    """UPDATE change_requests SET approval_status='rejected', approved_by=?, approved_at=?,
+                       decision_note='取消未生效成果物及其变更申请'
+                       WHERE id=? AND approval_status='pending'""",
+                    (operator_name, occurred_at, artifact["change_request_id"]),
+                )
+                if canceled_change.rowcount != 1:
+                    raise ValueError("成果物关联的变更申请已被处理，请刷新后重试。")
+            before_value = json.dumps(dict(artifact), ensure_ascii=False, default=str)
+            self.conn.execute("DELETE FROM artifacts WHERE id=?", (artifact_id,))
+            operation = "cancel" if frozen else "delete"
+            description = "取消冻结范围内未生效成果物" if frozen else "删除未冻结成果物"
+            event_id = new_event_id()
+            self.conn.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                              operation_type, before_value, after_value, description,
+                                                              event_id, result)
+                                 VALUES(?,?,'artifact',?,?,?,'',?,?,'success')""",
+                              (operator_name, occurred_at, artifact_id, operation, before_value, description, event_id))
+            attachment = self._safe_artifact_attachment_path(artifact["file_path"])
+            self.conn.commit()
+            attachment_deleted = False
+            if attachment:
+                try:
+                    attachment.unlink()
+                    attachment_deleted = True
+                except OSError:
+                    LOGGER.exception("artifact_attachment_delete_failed artifact_id=%s path=%s", artifact_id, attachment)
+            audit_event(operator_name, "artifact", artifact_id, operation, description, event_id=event_id)
+            return {"canceled": frozen, "attachment_deleted": attachment_deleted}
+        except Exception as exc:
+            self.conn.rollback()
+            log_transaction_exception("delete_artifact", exc)
+            raise
+
+    def update_funding_application(self, application_id, amount, description, operator_name, occurred_at):
+        try:
+            amount = float(amount)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("申报金额必须是有效数值。") from exc
+        if not math.isfinite(amount) or amount <= 0:
+            raise ValueError("申报金额必须是大于 0 的有限数值。")
+        amount = round(amount, 2)
+        if amount <= 0:
+            raise ValueError("申报金额按两位小数计价后必须大于 0。")
+        description = str(description or "").strip()
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            row = self.conn.execute("SELECT * FROM funding_applications WHERE id=?", (application_id,)).fetchone()
+            if not row:
+                raise ValueError("资金申报不存在。")
+            if row["applicant_name"] != operator_name:
+                raise ValueError("只有申请人可以编辑资金申报。")
+            if row["status"] not in {"草稿", "已驳回"}:
+                raise ValueError("只能编辑草稿或已驳回的资金申报。")
+            before_value = {
+                "amount": float(row["amount"]),
+                "description": row["description"] or "",
+                "status": row["status"],
+            }
+            after_value = {"amount": amount, "description": description, "status": row["status"]}
+            cur = self.conn.execute(
+                """UPDATE funding_applications SET amount=?, description=?, updated_at=?
+                   WHERE id=? AND status IN ('草稿','已驳回')""",
+                (amount, description, occurred_at, application_id),
+            )
+            if cur.rowcount != 1:
+                self.conn.rollback()
+                return False
+            event_id = new_event_id()
+            self.conn.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                              operation_type, before_value, after_value, description,
+                                                              event_id, result)
+                                 VALUES(?,?,'funding_application',?,'update',?,?,?,?, 'success')""",
+                              (operator_name, occurred_at, application_id,
+                               json.dumps(before_value, ensure_ascii=False),
+                               json.dumps(after_value, ensure_ascii=False),
+                               "编辑资金申报", event_id))
+            self.conn.commit()
+            audit_event(operator_name, "funding_application", application_id, "update", "编辑资金申报", event_id=event_id)
+            return True
+        except Exception as exc:
+            self.conn.rollback()
+            log_transaction_exception("update_funding_application", exc)
+            raise
+
     def transition_funding_application(self, application_id, from_status, to_status, operator_name, occurred_at):
         if to_status not in FUNDING_TRANSITIONS.get(from_status, []):
             raise ValueError(f"不允许从“{from_status}”流转到“{to_status}”。")
         try:
             self.conn.execute("BEGIN IMMEDIATE")
-            row = self.conn.execute("SELECT status FROM funding_applications WHERE id=?", (application_id,)).fetchone()
+            row = self.conn.execute(
+                "SELECT status, applicant_name FROM funding_applications WHERE id=?", (application_id,)
+            ).fetchone()
             if not row or row["status"] != from_status:
                 self.conn.rollback()
                 return False
+            if to_status == "已提交" and row["applicant_name"] != operator_name:
+                raise ValueError("只有申请人可以提交或重新提交资金申报。")
             submitted_at = occurred_at if to_status == "已提交" else None
             reviewed_by = operator_name if to_status in {"审批中", "已批复", "已驳回", "已拨付"} else None
             reviewed_at = occurred_at if reviewed_by else None
-            cur = self.conn.execute("""UPDATE funding_applications SET status=?,
-                                       submitted_at=COALESCE(?, submitted_at), reviewed_by=COALESCE(?, reviewed_by),
-                                       reviewed_at=COALESCE(?, reviewed_at), updated_at=?
-                                       WHERE id=? AND status=?""",
-                                    (to_status, submitted_at, reviewed_by, reviewed_at, occurred_at, application_id, from_status))
+            if to_status == "已提交":
+                cur = self.conn.execute("""UPDATE funding_applications SET status=?, submitted_at=?,
+                                           reviewed_by=NULL, reviewed_at=NULL, updated_at=?
+                                           WHERE id=? AND status=?""",
+                                        (to_status, submitted_at, occurred_at, application_id, from_status))
+            else:
+                cur = self.conn.execute("""UPDATE funding_applications SET status=?,
+                                           reviewed_by=COALESCE(?, reviewed_by),
+                                           reviewed_at=COALESCE(?, reviewed_at), updated_at=?
+                                           WHERE id=? AND status=?""",
+                                        (to_status, reviewed_by, reviewed_at, occurred_at, application_id, from_status))
             if cur.rowcount != 1:
                 self.conn.rollback()
                 return False
@@ -898,6 +1167,59 @@ class Database:
             log_transaction_exception("create_operation_record", exc)
             raise
 
+    def _create_version_baseline_record(self, version_id, operator_name, occurred_at):
+        version = self.conn.execute(
+            "SELECT * FROM implementation_versions WHERE id=?", (version_id,)
+        ).fetchone()
+        if not version:
+            raise ValueError("版本不存在。")
+        summary = self.conn.execute("""SELECT COUNT(*) requirement_count,
+                                              COALESCE(SUM(allocated_budget),0) allocated_budget,
+                                              COALESCE(SUM(actual_cost),0) actual_cost,
+                                              COALESCE(SUM(estimated_hours),0) estimated_hours,
+                                              COALESCE(SUM(actual_hours),0) actual_hours
+                                       FROM requirements WHERE version_id=? AND is_deleted=0""", (version_id,)).fetchone()
+        last = self.conn.execute(
+            "SELECT COALESCE(MAX(snapshot_no),0) snapshot_no FROM version_baselines WHERE version_id=?",
+            (version_id,),
+        ).fetchone()
+        snapshot_no = int(last["snapshot_no"] or 0) + 1
+        cur = self.conn.execute("""INSERT INTO version_baselines(version_id, snapshot_no, version_budget,
+                                                                 requirement_count, allocated_budget, actual_cost,
+                                                                 estimated_hours, actual_hours, created_by, created_at)
+                                  VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                                (version_id, snapshot_no, version["version_budget"], summary["requirement_count"],
+                                 summary["allocated_budget"], summary["actual_cost"], summary["estimated_hours"],
+                                 summary["actual_hours"], operator_name, occurred_at))
+        baseline_id = cur.lastrowid
+        self.conn.execute("""INSERT INTO version_baseline_requirements(
+                                 baseline_id, requirement_id, requirement_code, requirement_name, requirement_description,
+                                 business_key, source_role, proposer_name, owner_name, requirement_type, tags, status,
+                                 priority, estimated_budget, allocated_budget, actual_cost, estimated_hours, actual_hours,
+                                 planned_finish_date, actual_finish_date, remark, parent_requirement_id,
+                                 parent_requirement_code, created_at, updated_at)
+                             SELECT ?, r.id, r.requirement_code, r.requirement_name, r.requirement_description,
+                                    r.business_key, r.source_role, r.proposer_name, r.owner_name, r.requirement_type,
+                                    r.tags, r.status, r.priority, r.estimated_budget, r.allocated_budget, r.actual_cost,
+                                    r.estimated_hours, r.actual_hours, r.planned_finish_date, r.actual_finish_date,
+                                    r.remark, r.parent_requirement_id, p.requirement_code, r.created_at, r.updated_at
+                             FROM requirements r LEFT JOIN requirements p ON p.id=r.parent_requirement_id
+                             WHERE r.version_id=? AND r.is_deleted=0""", (baseline_id, version_id))
+        self.conn.execute("""INSERT INTO version_baseline_artifacts(
+                                 baseline_id, artifact_id, artifact_code, artifact_name, artifact_type, file_path,
+                                 related_object_type, related_object_id, version_no, description, visibility,
+                                 uploaded_by, uploaded_at)
+                             SELECT ?, a.id, a.artifact_code, a.artifact_name, a.artifact_type, a.file_path,
+                                    a.related_object_type, a.related_object_id, a.version_no, a.description,
+                                    a.visibility, a.uploaded_by, a.uploaded_at
+                             FROM artifacts a
+                             WHERE a.approval_status='approved' AND (
+                                 (a.related_object_type='版本' AND a.related_object_id=?) OR
+                                 (a.related_object_type='需求' AND a.related_object_id IN
+                                     (SELECT id FROM requirements WHERE version_id=? AND is_deleted=0))
+                             )""", (baseline_id, version_id, version_id))
+        return {"baseline_id": baseline_id, "snapshot_no": snapshot_no}
+
     def freeze_version_with_baseline(self, version_id, operator_name, occurred_at):
         try:
             self.conn.execute("BEGIN IMMEDIATE")
@@ -907,48 +1229,20 @@ class Database:
             if version["is_frozen"]:
                 self.conn.rollback()
                 return None
-            summary = self.conn.execute("""SELECT COUNT(*) requirement_count,
-                                                  COALESCE(SUM(allocated_budget),0) allocated_budget,
-                                                  COALESCE(SUM(actual_cost),0) actual_cost,
-                                                  COALESCE(SUM(estimated_hours),0) estimated_hours,
-                                                  COALESCE(SUM(actual_hours),0) actual_hours
-                                           FROM requirements WHERE version_id=? AND is_deleted=0""", (version_id,)).fetchone()
-            last = self.conn.execute("SELECT COALESCE(MAX(snapshot_no),0) snapshot_no FROM version_baselines WHERE version_id=?", (version_id,)).fetchone()
-            snapshot_no = int(last["snapshot_no"] or 0) + 1
-            cur = self.conn.execute("""INSERT INTO version_baselines(version_id, snapshot_no, version_budget,
-                                                                     requirement_count, allocated_budget, actual_cost,
-                                                                     estimated_hours, actual_hours, created_by, created_at)
-                                      VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                                    (version_id, snapshot_no, version["version_budget"], summary["requirement_count"],
-                                     summary["allocated_budget"], summary["actual_cost"], summary["estimated_hours"],
-                                     summary["actual_hours"], operator_name, occurred_at))
-            baseline_id = cur.lastrowid
-            self.conn.execute("""INSERT INTO version_baseline_requirements(
-                                     baseline_id, requirement_id, requirement_code, requirement_name, requirement_description,
-                                     business_key, source_role, proposer_name, owner_name, requirement_type, tags, status,
-                                     priority, estimated_budget, allocated_budget, actual_cost, estimated_hours, actual_hours,
-                                     planned_finish_date, actual_finish_date, remark, parent_requirement_id,
-                                     parent_requirement_code, created_at, updated_at)
-                                 SELECT ?, r.id, r.requirement_code, r.requirement_name, r.requirement_description,
-                                        r.business_key, r.source_role, r.proposer_name, r.owner_name, r.requirement_type,
-                                        r.tags, r.status, r.priority, r.estimated_budget, r.allocated_budget, r.actual_cost,
-                                        r.estimated_hours, r.actual_hours, r.planned_finish_date, r.actual_finish_date,
-                                        r.remark, r.parent_requirement_id, p.requirement_code, r.created_at, r.updated_at
-                                 FROM requirements r LEFT JOIN requirements p ON p.id=r.parent_requirement_id
-                                 WHERE r.version_id=? AND r.is_deleted=0""", (baseline_id, version_id))
-            self.conn.execute("""INSERT INTO version_baseline_artifacts(
-                                     baseline_id, artifact_id, artifact_code, artifact_name, artifact_type, file_path,
-                                     related_object_type, related_object_id, version_no, description, visibility,
-                                     uploaded_by, uploaded_at)
-                                 SELECT ?, a.id, a.artifact_code, a.artifact_name, a.artifact_type, a.file_path,
-                                        a.related_object_type, a.related_object_id, a.version_no, a.description,
-                                        a.visibility, a.uploaded_by, a.uploaded_at
-                                 FROM artifacts a
-                                 WHERE a.approval_status='approved' AND (
-                                     (a.related_object_type='版本' AND a.related_object_id=?) OR
-                                     (a.related_object_type='需求' AND a.related_object_id IN
-                                         (SELECT id FROM requirements WHERE version_id=? AND is_deleted=0))
-                                 )""", (baseline_id, version_id, version_id))
+            submitted_artifact = self.conn.execute("""SELECT id FROM artifacts
+                                                       WHERE approval_status='submitted' AND (
+                                                           (related_object_type='版本' AND related_object_id=?) OR
+                                                           (related_object_type='需求' AND related_object_id IN
+                                                               (SELECT id FROM requirements
+                                                                WHERE version_id=? AND is_deleted=0))
+                                                       ) LIMIT 1""", (version_id, version_id)).fetchone()
+            if submitted_artifact:
+                raise ValueError(
+                    f"版本仍有待审批成果物 #{submitted_artifact['id']}，请先审批或取消后再发布。"
+                )
+            baseline = self._create_version_baseline_record(version_id, operator_name, occurred_at)
+            baseline_id = baseline["baseline_id"]
+            snapshot_no = baseline["snapshot_no"]
             cur = self.conn.execute("""UPDATE implementation_versions SET is_frozen=1, status='published', updated_at=?
                                        WHERE id=? AND is_frozen=0""", (occurred_at, version_id))
             if cur.rowcount != 1:
@@ -962,15 +1256,61 @@ class Database:
                                f"baseline:{baseline_id}", f"发布版本并生成基线 #{snapshot_no}", event_id))
             self.conn.commit()
             audit_event(operator_name, "implementation_version", version_id, "publish", f"发布版本并生成基线 #{snapshot_no}", event_id=event_id)
-            return {"baseline_id": baseline_id, "snapshot_no": snapshot_no}
+            return baseline
         except Exception as exc:
             self.conn.rollback()
             log_transaction_exception("freeze_version", exc)
             raise
 
-    def review_change_request(self, change_id, status, operator_name, occurred_at):
+    def _change_payload(self, change_id):
+        payload = self.conn.execute(
+            "SELECT * FROM change_request_payloads WHERE change_request_id=?", (change_id,)
+        ).fetchone()
+        if not payload:
+            raise ValueError("变更申请缺少变更载荷，不能处理。")
+        try:
+            proposed = json.loads(payload["proposed_value"] or "{}")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("变更申请载荷不是有效 JSON。") from exc
+        if not isinstance(proposed, dict):
+            raise ValueError("变更申请载荷必须是对象结构。")
+        if payload["change_type"] not in {"update", "delete", "artifact_add"}:
+            raise ValueError("变更申请内容类型无效。")
+        return payload, proposed
+
+    def _current_baseline_sequence(self, version_id):
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(snapshot_no),0) snapshot_no FROM version_baselines WHERE version_id=?",
+            (version_id,),
+        ).fetchone()
+        return int(row["snapshot_no"] or 0)
+
+    def _ensure_change_baseline_current(self, change):
+        current = self._current_baseline_sequence(change["version_id"])
+        expected = int(change["expected_baseline_sequence"] or 0)
+        if current != expected:
+            raise ValueError(
+                f"变更申请基于的版本基线已过期：预期基线 #{expected}，当前基线 #{current}，请基于最新基线重新提交。"
+            )
+        return current
+
+    @staticmethod
+    def _change_conflict_targets(change, payload, proposed):
+        if payload["change_type"] in {"update", "delete"}:
+            requirement_id = change["requirement_id"]
+            return {("requirement", str(requirement_id))} if requirement_id else set()
+        artifact_id = proposed.get("artifact_id")
+        return {("artifact", str(artifact_id))} if artifact_id else set()
+
+    def review_change_request(self, change_id, status, operator_name, occurred_at, decision_note=""):
         if status not in {"approved", "rejected"}:
             raise ValueError("无效的审批状态。")
+        operator_name = str(operator_name or "").strip()
+        decision_note = str(decision_note or "").strip()
+        if not operator_name:
+            raise ValueError("审批人不能为空。")
+        if not decision_note:
+            raise ValueError("审批意见不能为空。")
         try:
             self.conn.execute("BEGIN IMMEDIATE")
             change = self.conn.execute("SELECT * FROM change_requests WHERE id=?", (change_id,)).fetchone()
@@ -978,107 +1318,195 @@ class Database:
                 raise ValueError("变更申请不存在。")
             if change["approval_status"] != "pending":
                 raise ValueError("该变更申请已被其他操作处理，请刷新后重试。")
-            payload = self.conn.execute("SELECT * FROM change_request_payloads WHERE change_request_id=?", (change_id,)).fetchone()
-            if not payload:
-                raise ValueError("变更申请缺少变更载荷，不能审批。")
-            try:
-                proposed = json.loads(payload["proposed_value"] or "{}")
-            except (TypeError, ValueError) as exc:
-                raise ValueError("变更申请载荷不是有效 JSON。") from exc
-            if not isinstance(proposed, dict):
-                raise ValueError("变更申请载荷必须是对象结构。")
-            change_type = payload["change_type"]
-            if change_type == "artifact_add":
+            if operator_name.casefold() == str(change["requested_by"] or "").strip().casefold():
+                raise ValueError("变更申请人不能审批自己的申请，请录入另一名实际复核人。")
+            payload, proposed = self._change_payload(change_id)
+            if payload["change_type"] == "artifact_add":
                 artifact_id = int(proposed.get("artifact_id") or 0)
                 artifact = self.conn.execute(
-                    "SELECT id FROM artifacts WHERE id=? AND change_request_id=? AND approval_status='pending'",
+                    "SELECT * FROM artifacts WHERE id=? AND change_request_id=? AND approval_status='pending'",
                     (artifact_id, change_id),
                 ).fetchone()
                 if not artifact:
                     raise ValueError("待审批成果物不存在或状态不一致。")
-                self.conn.execute("UPDATE artifacts SET approval_status=? WHERE id=?",
-                                  ("approved" if status == "approved" else "rejected", artifact_id))
-            elif change_type not in {"update", "delete"}:
-                raise ValueError("变更申请内容类型无效。")
-            elif status == "approved":
-                if not change["requirement_id"]:
-                    raise ValueError("需求变更申请缺少关联需求。")
-                requirement = self.conn.execute("SELECT * FROM requirements WHERE id=?", (change["requirement_id"],)).fetchone()
-                if not requirement or requirement["is_deleted"]:
-                    raise ValueError("关联需求不存在或已删除，无法应用变更。")
-                if change_type == "delete":
-                    self.conn.execute("UPDATE requirements SET is_deleted=1, updated_at=? WHERE id=?",
-                                      (occurred_at, change["requirement_id"]))
-                elif change_type == "update":
-                    required_values = [proposed.get("requirement_name"), proposed.get("requirement_description"), proposed.get("source_role")]
-                    if not all(str(value or "").strip() for value in required_values):
-                        raise ValueError("变更内容缺少需求名称、描述或来源角色。")
-                    estimated_budget = float(proposed.get("estimated_budget", 0) or 0)
-                    if not math.isfinite(estimated_budget) or estimated_budget < 0:
-                        raise ValueError("变更后的预估预算必须是大于等于 0 的有限数值。")
-                    estimated_hours = float(proposed.get("estimated_hours", requirement["estimated_hours"] or 0) or 0)
-                    if not math.isfinite(estimated_hours) or estimated_hours < 0:
-                        raise ValueError("变更后的预估工时必须是大于等于 0 的有限数值。")
-                    business_key = requirement_business_key(proposed)
-                    candidates = self.conn.execute("""SELECT id, business_key, requirement_name FROM requirements
-                                                       WHERE project_id=?
-                                                         AND ((version_id=?) OR (version_id IS NULL AND ? IS NULL))
-                                                         AND id<>? AND is_deleted=0""",
-                                                   (requirement["project_id"], requirement["version_id"],
-                                                    requirement["version_id"], requirement["id"])).fetchall()
-                    if any(requirement_business_key(candidate) == business_key for candidate in candidates):
-                        raise ValueError("同一版本内业务需求标识不能重复。")
-                    parent_id = proposed.get("parent_requirement_id", requirement["parent_requirement_id"])
-                    parent_id = int(parent_id) if parent_id not in (None, "") else None
-                    if parent_id:
-                        parent = self.conn.execute(
-                            "SELECT id FROM requirements WHERE id=? AND project_id=? AND is_deleted=0",
-                            (parent_id, requirement["project_id"]),
-                        ).fetchone()
-                        if not parent or parent_id == requirement["id"]:
-                            raise ValueError("关联原需求必须是同一项目内的其他有效需求。")
-                        cycle = self.conn.execute("""WITH RECURSIVE descendants(id) AS (
-                                                        SELECT id FROM requirements WHERE parent_requirement_id=? AND is_deleted=0
-                                                        UNION
-                                                        SELECT r.id FROM requirements r JOIN descendants d ON r.parent_requirement_id=d.id
-                                                        WHERE r.is_deleted=0
-                                                      ) SELECT 1 FROM descendants WHERE id=? LIMIT 1""",
-                                                  (requirement["id"], parent_id)).fetchone()
-                        if cycle:
-                            raise ValueError("关联原需求会形成循环关系。")
-                    planned_finish = normalize_date(proposed.get("planned_finish_date", ""), "预计完成时间")
-                    self.conn.execute("""UPDATE requirements SET requirement_name=?, requirement_description=?,
-                                           business_key=?, source_role=?, proposer_name=?, owner_name=?, requirement_type=?, tags=?,
-                                           priority=?, estimated_budget=?, estimated_hours=?, planned_finish_date=?, remark=?, parent_requirement_id=?,
-                                           status='变更中', updated_at=? WHERE id=?""",
-                                      (proposed.get("requirement_name", ""), proposed.get("requirement_description", ""),
-                                       business_key, proposed.get("source_role", ""), proposed.get("proposer_name", ""), proposed.get("owner_name", ""),
-                                       proposed.get("requirement_type", ""), proposed.get("tags", ""), proposed.get("priority", "P1"),
-                                       estimated_budget, estimated_hours, planned_finish, proposed.get("remark", ""),
-                                       parent_id, occurred_at, change["requirement_id"]))
-                    self.conn.execute("""INSERT INTO requirement_status_history(requirement_id, from_status, to_status,
-                                                                                  operator_name, transition_note, changed_at)
-                                         VALUES(?,?,'变更中',?,?,?)""",
-                                      (change["requirement_id"], requirement["status"], operator_name,
-                                       f"变更申请 #{change_id} 审批通过", occurred_at))
-            cur = self.conn.execute("""UPDATE change_requests SET approval_status=?, approved_by=?, approved_at=?
+                if operator_name.casefold() == str(artifact["uploaded_by"] or "").strip().casefold():
+                    raise ValueError("成果物上传人不能审批自己的成果物变更。")
+                if status == "rejected":
+                    self.conn.execute("""UPDATE artifacts SET approval_status='rejected', reviewed_by=?,
+                                         reviewed_at=?, review_note=? WHERE id=? AND approval_status='pending'""",
+                                      (operator_name, occurred_at, decision_note, artifact_id))
+            elif not change["requirement_id"]:
+                raise ValueError("需求变更申请缺少关联需求。")
+            else:
+                requirement = self.conn.execute(
+                    "SELECT id, version_id, is_deleted FROM requirements WHERE id=?", (change["requirement_id"],)
+                ).fetchone()
+                if not requirement or requirement["is_deleted"] or requirement["version_id"] != change["version_id"]:
+                    raise ValueError("关联需求不存在、已删除或不属于当前版本。")
+            if status == "approved":
+                self._ensure_change_baseline_current(change)
+                current_targets = self._change_conflict_targets(change, payload, proposed)
+                approved_changes = self.conn.execute(
+                    """SELECT c.*, p.change_type, p.proposed_value
+                       FROM change_requests c
+                       JOIN change_request_payloads p ON p.change_request_id=c.id
+                       WHERE c.version_id=? AND c.approval_status='approved'
+                         AND c.expected_baseline_sequence=? AND c.id<>?""",
+                    (change["version_id"], change["expected_baseline_sequence"], change_id),
+                ).fetchall()
+                for approved in approved_changes:
+                    try:
+                        approved_proposed = json.loads(approved["proposed_value"] or "{}")
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"已批准变更 #{approved['id']} 的载荷无效，不能继续审批。") from exc
+                    if not isinstance(approved_proposed, dict):
+                        raise ValueError(f"已批准变更 #{approved['id']} 的载荷无效，不能继续审批。")
+                    if current_targets & self._change_conflict_targets(approved, approved, approved_proposed):
+                        raise ValueError(f"变更内容与已批准申请 #{approved['id']} 重叠，请先执行该申请。")
+            cur = self.conn.execute("""UPDATE change_requests
+                                       SET approval_status=?, approved_by=?, approved_at=?, decision_note=?
                                        WHERE id=? AND approval_status='pending'""",
-                                    (status, operator_name, occurred_at, change_id))
+                                    (status, operator_name, occurred_at, decision_note, change_id))
             if cur.rowcount != 1:
                 raise ValueError("该变更申请已被其他操作处理，请刷新后重试。")
             event_id = new_event_id()
+            description = "变更申请已批准，等待执行" if status == "approved" else "变更申请已驳回"
             self.conn.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
                                                               operation_type, before_value, after_value, description,
                                                               event_id, result)
                                  VALUES(?,?,?,?,?,?,?,?,?,'success')""",
-                              (operator_name, occurred_at, "change_request", change_id, status, str(dict(change)), status,
-                               "变更申请通过" if status == "approved" else "变更申请驳回", event_id))
+                              (operator_name, occurred_at, "change_request", change_id, status,
+                               str(dict(change)), status, description, event_id))
             self.conn.commit()
-            audit_event(operator_name, "change_request", change_id, status, "变更申请通过" if status == "approved" else "变更申请驳回", event_id=event_id)
-            return change
+            audit_event(operator_name, "change_request", change_id, status, description, event_id=event_id)
+            return self.one("SELECT * FROM change_requests WHERE id=?", (change_id,))
         except Exception as exc:
             self.conn.rollback()
             log_transaction_exception("review_change_request", exc)
+            raise
+
+    def _apply_change_business(self, change, payload, proposed, operator_name, occurred_at):
+        change_id = change["id"]
+        change_type = payload["change_type"]
+        if change_type == "artifact_add":
+            artifact_id = int(proposed.get("artifact_id") or 0)
+            artifact = self.conn.execute(
+                "SELECT id FROM artifacts WHERE id=? AND change_request_id=? AND approval_status='pending'",
+                (artifact_id, change_id),
+            ).fetchone()
+            if not artifact:
+                raise ValueError("待执行成果物不存在或状态不一致。")
+            self.conn.execute("""UPDATE artifacts SET approval_status='approved', reviewed_by=?, reviewed_at=?,
+                                 review_note=? WHERE id=? AND approval_status='pending'""",
+                              (change["approved_by"], change["approved_at"], change["decision_note"], artifact_id))
+            return
+        if not change["requirement_id"]:
+            raise ValueError("需求变更申请缺少关联需求。")
+        requirement = self.conn.execute(
+            "SELECT * FROM requirements WHERE id=?", (change["requirement_id"],)
+        ).fetchone()
+        if not requirement or requirement["is_deleted"] or requirement["version_id"] != change["version_id"]:
+            raise ValueError("关联需求不存在、已删除或不属于当前版本，无法执行变更。")
+        if change_type == "delete":
+            cur = self.conn.execute(
+                "UPDATE requirements SET is_deleted=1, updated_at=? WHERE id=? AND is_deleted=0",
+                (occurred_at, change["requirement_id"]),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("关联需求已被其他操作更新，请刷新后重试。")
+            return
+        required_values = [proposed.get("requirement_name"), proposed.get("requirement_description"), proposed.get("source_role")]
+        if not all(str(value or "").strip() for value in required_values):
+            raise ValueError("变更内容缺少需求名称、描述或来源角色。")
+        estimated_budget = float(proposed.get("estimated_budget", 0) or 0)
+        if not math.isfinite(estimated_budget) or estimated_budget < 0:
+            raise ValueError("变更后的预估预算必须是大于等于 0 的有限数值。")
+        estimated_hours = float(proposed.get("estimated_hours", requirement["estimated_hours"] or 0) or 0)
+        if not math.isfinite(estimated_hours) or estimated_hours < 0:
+            raise ValueError("变更后的预估工时必须是大于等于 0 的有限数值。")
+        business_key = requirement_business_key(proposed)
+        candidates = self.conn.execute("""SELECT id, business_key, requirement_name FROM requirements
+                                           WHERE project_id=?
+                                             AND ((version_id=?) OR (version_id IS NULL AND ? IS NULL))
+                                             AND id<>? AND is_deleted=0""",
+                                       (requirement["project_id"], requirement["version_id"],
+                                        requirement["version_id"], requirement["id"])).fetchall()
+        if any(requirement_business_key(candidate) == business_key for candidate in candidates):
+            raise ValueError("同一版本内业务需求标识不能重复。")
+        parent_id = proposed.get("parent_requirement_id", requirement["parent_requirement_id"])
+        parent_id = int(parent_id) if parent_id not in (None, "") else None
+        if parent_id:
+            parent = self.conn.execute(
+                "SELECT id FROM requirements WHERE id=? AND project_id=? AND is_deleted=0",
+                (parent_id, requirement["project_id"]),
+            ).fetchone()
+            if not parent or parent_id == requirement["id"]:
+                raise ValueError("关联原需求必须是同一项目内的其他有效需求。")
+            cycle = self.conn.execute("""WITH RECURSIVE descendants(id) AS (
+                                            SELECT id FROM requirements WHERE parent_requirement_id=? AND is_deleted=0
+                                            UNION
+                                            SELECT r.id FROM requirements r JOIN descendants d ON r.parent_requirement_id=d.id
+                                            WHERE r.is_deleted=0
+                                          ) SELECT 1 FROM descendants WHERE id=? LIMIT 1""",
+                                      (requirement["id"], parent_id)).fetchone()
+            if cycle:
+                raise ValueError("关联原需求会形成循环关系。")
+        planned_finish = normalize_date(proposed.get("planned_finish_date", ""), "预计完成时间")
+        self.conn.execute("""UPDATE requirements SET requirement_name=?, requirement_description=?,
+                               business_key=?, source_role=?, proposer_name=?, owner_name=?, requirement_type=?, tags=?,
+                               priority=?, estimated_budget=?, estimated_hours=?, planned_finish_date=?, remark=?, parent_requirement_id=?,
+                               status='变更中', updated_at=? WHERE id=?""",
+                          (proposed.get("requirement_name", ""), proposed.get("requirement_description", ""),
+                           business_key, proposed.get("source_role", ""), proposed.get("proposer_name", ""), proposed.get("owner_name", ""),
+                           proposed.get("requirement_type", ""), proposed.get("tags", ""), proposed.get("priority", "P1"),
+                           estimated_budget, estimated_hours, planned_finish, proposed.get("remark", ""),
+                           parent_id, occurred_at, change["requirement_id"]))
+        self.conn.execute("""INSERT INTO requirement_status_history(requirement_id, from_status, to_status,
+                                                                      operator_name, transition_note, changed_at)
+                             VALUES(?,?,'变更中',?,?,?)""",
+                          (change["requirement_id"], requirement["status"], operator_name,
+                           f"执行变更申请 #{change_id}", occurred_at))
+
+    def apply_change_request(self, change_id, operator_name, occurred_at):
+        operator_name = str(operator_name or "").strip()
+        if not operator_name:
+            raise ValueError("执行人不能为空。")
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            change = self.conn.execute("SELECT * FROM change_requests WHERE id=?", (change_id,)).fetchone()
+            if not change:
+                raise ValueError("变更申请不存在。")
+            if change["approval_status"] != "approved":
+                raise ValueError("只能执行已批准且尚未执行的变更申请。")
+            version = self.conn.execute(
+                "SELECT id, is_frozen FROM implementation_versions WHERE id=?", (change["version_id"],)
+            ).fetchone()
+            if not version or not version["is_frozen"]:
+                raise ValueError("变更申请关联的冻结版本不存在或状态无效。")
+            self._ensure_change_baseline_current(change)
+            payload, proposed = self._change_payload(change_id)
+            self._apply_change_business(change, payload, proposed, operator_name, occurred_at)
+            baseline = self._create_version_baseline_record(change["version_id"], operator_name, occurred_at)
+            cur = self.conn.execute("""UPDATE change_requests
+                                       SET approval_status='applied', applied_by=?, applied_at=?, applied_baseline_id=?
+                                       WHERE id=? AND approval_status='approved'""",
+                                    (operator_name, occurred_at, baseline["baseline_id"], change_id))
+            if cur.rowcount != 1:
+                raise ValueError("该变更申请已被其他操作执行，请刷新后重试。")
+            event_id = new_event_id()
+            description = f"执行变更申请并生成基线 #{baseline['snapshot_no']}"
+            self.conn.execute("""INSERT INTO operation_logs(operator_name, operation_time, object_type, object_id,
+                                                              operation_type, before_value, after_value, description,
+                                                              event_id, result)
+                                 VALUES(?,?,?,?,?,?,?,?,?,'success')""",
+                              (operator_name, occurred_at, "change_request", change_id, "apply",
+                               "approved", f"applied:baseline:{baseline['baseline_id']}", description, event_id))
+            self.conn.commit()
+            audit_event(operator_name, "change_request", change_id, "apply", description, event_id=event_id)
+            return baseline
+        except Exception as exc:
+            self.conn.rollback()
+            log_transaction_exception("apply_change_request", exc)
             raise
 
     def claim_requirement(self, requirement_id, operator_name, occurred_at):
@@ -1238,8 +1666,8 @@ class Database:
         if "current_stage" not in project_columns:
             raise RuntimeError("planning_projects 缺少当前阶段字段。")
         artifact_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(artifacts)")}
-        if not {"visibility", "approval_status", "change_request_id"}.issubset(artifact_columns):
-            raise RuntimeError("artifacts 缺少可见范围或审批字段。")
+        if not {"visibility", "approval_status", "change_request_id", "reviewed_by", "reviewed_at", "review_note"}.issubset(artifact_columns):
+            raise RuntimeError("artifacts 缺少可见范围或完整审批字段。")
         baseline_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(version_baseline_requirements)")}
         if not {"requirement_description", "business_key", "source_role", "owner_name", "estimated_budget",
                 "estimated_hours", "planned_finish_date", "remark", "parent_requirement_id"}.issubset(baseline_columns):
@@ -1247,6 +1675,10 @@ class Database:
         baseline_header_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(version_baselines)")}
         if not {"estimated_hours", "actual_hours"}.issubset(baseline_header_columns):
             raise RuntimeError("version_baselines 缺少工时汇总字段。")
+        change_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(change_requests)")}
+        if not {"expected_baseline_sequence", "decision_note", "applied_by", "applied_at",
+                "applied_baseline_id"}.issubset(change_columns):
+            raise RuntimeError("change_requests 缺少基线并发或独立执行字段。")
         funding_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(funding_applications)")}
         if not {"project_id", "annual_plan_id", "amount", "status", "applicant_name"}.issubset(funding_columns):
             raise RuntimeError("funding_applications 字段不完整。")
@@ -1266,14 +1698,25 @@ class Database:
             "基线需求": "SELECT COUNT(*) c FROM version_baseline_requirements r LEFT JOIN version_baselines b ON b.id=r.baseline_id WHERE b.id IS NULL",
             "基线成果物": "SELECT COUNT(*) c FROM version_baseline_artifacts a LEFT JOIN version_baselines b ON b.id=a.baseline_id WHERE b.id IS NULL",
             "变更载荷": "SELECT COUNT(*) c FROM change_request_payloads p LEFT JOIN change_requests c ON c.id=p.change_request_id WHERE c.id IS NULL",
+            "变更执行基线": "SELECT COUNT(*) c FROM change_requests c LEFT JOIN version_baselines b ON b.id=c.applied_baseline_id WHERE c.applied_baseline_id IS NOT NULL AND (b.id IS NULL OR b.version_id<>c.version_id)",
         }
         for label, sql in orphan_checks.items():
             if self.conn.execute(sql).fetchone()["c"]:
                 raise RuntimeError(f"发现孤立关联数据：{label}")
         value_checks = {
             "项目阶段": "SELECT COUNT(*) c FROM planning_projects WHERE current_stage NOT IN ('宏观规划','规划细化','建设落地','招投标','项目交付验收','运维运营')",
-            "成果物状态": "SELECT COUNT(*) c FROM artifacts WHERE visibility NOT IN ('内部','客户可见') OR approval_status NOT IN ('pending','approved','rejected')",
-            "资金申报状态": "SELECT COUNT(*) c FROM funding_applications WHERE status NOT IN ('草稿','已提交','审批中','已批复','已驳回','已拨付') OR amount<=0",
+            "成果物状态": "SELECT COUNT(*) c FROM artifacts WHERE visibility IS NULL OR approval_status IS NULL OR visibility NOT IN ('内部','客户可见') OR approval_status NOT IN ('draft','submitted','pending','approved','rejected')",
+            "变更申请状态": """SELECT COUNT(*) c FROM change_requests
+                                  WHERE approval_status IS NULL
+                                     OR approval_status NOT IN ('pending','approved','rejected','applied')
+                                     OR expected_baseline_sequence IS NULL OR expected_baseline_sequence<0
+                                     OR (approval_status='pending' AND
+                                         (approved_by IS NOT NULL OR approved_at IS NOT NULL OR applied_at IS NOT NULL))
+                                     OR (approval_status IN ('approved','rejected') AND
+                                         (approved_by IS NULL OR approved_at IS NULL OR applied_at IS NOT NULL))
+                                     OR (approval_status='applied' AND
+                                         (applied_by IS NULL OR applied_at IS NULL OR applied_baseline_id IS NULL))""",
+            "资金申报状态": "SELECT COUNT(*) c FROM funding_applications WHERE status IS NULL OR amount IS NULL OR status NOT IN ('草稿','已提交','审批中','已批复','已驳回','已拨付') OR amount<=0",
             "运营记录枚举": "SELECT COUNT(*) c FROM operation_records WHERE record_type NOT IN ('推广活动','线上问题','维护记录','问题解答','功能建议') OR status NOT IN ('待处理','处理中','已完成','已关闭')",
         }
         for label, sql in value_checks.items():
@@ -1387,8 +1830,11 @@ class Database:
             version_no TEXT,
             description TEXT,
             visibility TEXT DEFAULT '内部',
-            approval_status TEXT DEFAULT 'approved',
+            approval_status TEXT DEFAULT 'draft',
             change_request_id INTEGER,
+            reviewed_by TEXT,
+            reviewed_at TEXT,
+            review_note TEXT,
             uploaded_by TEXT,
             uploaded_at TEXT NOT NULL,
             created_at TEXT NOT NULL
@@ -1423,11 +1869,16 @@ class Database:
             change_title TEXT NOT NULL,
             change_reason TEXT,
             impact_scope TEXT,
+            expected_baseline_sequence INTEGER NOT NULL DEFAULT 0,
             approval_status TEXT DEFAULT 'pending',
             requested_by TEXT,
             requested_at TEXT NOT NULL,
             approved_by TEXT,
-            approved_at TEXT
+            approved_at TEXT,
+            decision_note TEXT,
+            applied_by TEXT,
+            applied_at TEXT,
+            applied_baseline_id INTEGER
         );
         CREATE TABLE IF NOT EXISTS requirement_status_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1602,11 +2053,15 @@ class Database:
             "visibility": "TEXT DEFAULT '内部'",
             "approval_status": "TEXT DEFAULT 'approved'",
             "change_request_id": "INTEGER",
+            "reviewed_by": "TEXT",
+            "reviewed_at": "TEXT",
+            "review_note": "TEXT",
         }.items():
             if column not in artifact_columns:
                 self.conn.execute(f"ALTER TABLE artifacts ADD COLUMN {column} {definition}")
         self.conn.execute("UPDATE artifacts SET visibility='内部' WHERE visibility IS NULL OR TRIM(visibility)=''")
         self.conn.execute("UPDATE artifacts SET approval_status='approved' WHERE approval_status IS NULL OR TRIM(approval_status)=''")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_artifacts_approval_status ON artifacts(approval_status)")
         baseline_header_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(version_baselines)")}
         for column in ("estimated_hours", "actual_hours"):
             if column not in baseline_header_columns:
@@ -1631,10 +2086,44 @@ class Database:
         if log_indexes.get("idx_operation_logs_event_id") != 1:
             self.conn.execute("DROP INDEX IF EXISTS idx_operation_logs_event_id")
             self.conn.execute("CREATE UNIQUE INDEX idx_operation_logs_event_id ON operation_logs(event_id) WHERE event_id IS NOT NULL")
+        change_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(change_requests)")}
+        legacy_approval_applied_immediately = "applied_at" not in change_columns
+        expected_baseline_added = "expected_baseline_sequence" not in change_columns
+        for column, definition in {
+            "expected_baseline_sequence": "INTEGER NOT NULL DEFAULT 0",
+            "decision_note": "TEXT",
+            "applied_by": "TEXT",
+            "applied_at": "TEXT",
+            "applied_baseline_id": "INTEGER",
+        }.items():
+            if column not in change_columns:
+                self.conn.execute(f"ALTER TABLE change_requests ADD COLUMN {column} {definition}")
+        if expected_baseline_added:
+            self.conn.execute("""UPDATE change_requests
+                                 SET expected_baseline_sequence=COALESCE((
+                                     SELECT MAX(b.snapshot_no) FROM version_baselines b
+                                     WHERE b.version_id=change_requests.version_id
+                                 ), 0)""")
+        if legacy_approval_applied_immediately:
+            legacy_versions = self.conn.execute(
+                "SELECT DISTINCT version_id FROM change_requests WHERE approval_status='approved' ORDER BY version_id"
+            ).fetchall()
+            for legacy_version in legacy_versions:
+                migration_baseline = self._create_version_baseline_record(
+                    legacy_version["version_id"], "系统迁移", now_text()
+                )
+                self.conn.execute("""UPDATE change_requests
+                                     SET approval_status='applied',
+                                         applied_by=COALESCE(approved_by, requested_by, '系统迁移'),
+                                         applied_at=COALESCE(approved_at, requested_at),
+                                         applied_baseline_id=?
+                                     WHERE version_id=? AND approval_status='approved'""",
+                                  (migration_baseline["baseline_id"], legacy_version["version_id"]))
         self.conn.execute("""UPDATE change_requests SET approval_status='rejected', approved_by='系统迁移', approved_at=COALESCE(approved_at, requested_at)
                              WHERE approval_status='pending' AND requirement_id IS NOT NULL
                                AND id NOT IN (SELECT MIN(id) FROM change_requests WHERE approval_status='pending' AND requirement_id IS NOT NULL GROUP BY requirement_id)""")
         self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_change_pending_requirement ON change_requests(requirement_id) WHERE approval_status='pending' AND requirement_id IS NOT NULL")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_change_version_status_baseline ON change_requests(version_id, approval_status, expected_baseline_sequence)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_funding_project ON funding_applications(project_id, annual_plan_id, status)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_operation_project ON operation_records(project_id, version_id, requirement_id)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_baseline_artifacts ON version_baseline_artifacts(baseline_id)")
@@ -1652,7 +2141,13 @@ class Database:
             for tag_name in ["业务痛点", "功能优化", "运维 Bug", "招投标要求", "验收整改", "客户新增", "版本必做", "待确认"]:
                 self.execute("INSERT INTO tag_definitions(tag_name, created_at) VALUES(?,?)", (tag_name, now_text()))
             initialized.append("标签字典")
-        seed_demo_data = os.environ.get("CRM_SEED_DEMO_DATA", "0").strip().lower() in {"1", "true", "yes", "on"}
+        # The demo fixture is only available to source-based developer tests.
+        # A packaged customer EXE must always start with an empty business database,
+        # even when its parent process happens to define CRM_SEED_DEMO_DATA.
+        seed_demo_data = (
+            not getattr(sys, "frozen", False)
+            and os.environ.get("CRM_SEED_DEMO_DATA", "0").strip().lower() in {"1", "true", "yes", "on"}
+        )
         if seed_demo_data and not self.one("SELECT id FROM planning_projects"):
             t = now_text()
             self.execute(
@@ -1713,7 +2208,9 @@ class Database:
                     (row["id"], "", row["status"], "系统", "初始化需求状态历史", row["created_at"]),
                 )
             initialized.append("需求状态历史")
-        if initialized:
+        # A production first launch should open with no business/audit history.
+        # Only the explicitly requested demo seed is itself an auditable event.
+        if "演示业务数据" in initialized:
             self.log("系统", "system", None, "init", "", "", "初始化：" + "、".join(initialized))
 
     def log(self, operator, object_type, object_id, operation_type, before_value, after_value, description, result="success"):
@@ -2752,10 +3249,14 @@ class App(tk.Tk):
                                     FROM operation_records o LEFT JOIN requirements r ON r.id=o.requirement_id
                                     WHERE o.project_id=? ORDER BY o.record_date DESC, o.id DESC LIMIT 8""", (project_id,))
         else:
+            change_summary = self.db.one("""SELECT
+                                                SUM(CASE WHEN approval_status='pending' THEN 1 ELSE 0 END) pending_count,
+                                                SUM(CASE WHEN approval_status='approved' THEN 1 ELSE 0 END) approved_count
+                                             FROM change_requests""")
             metrics = [
                 ("待规划池", self.requirement_count("project_id=? AND version_id IS NULL", [project_id]), "尚未确认落地版本", self.colors["warning"]),
                 ("已发布版本", self.db.one("SELECT COUNT(*) c FROM implementation_versions WHERE project_id=? AND is_frozen=1", (project_id,))["c"], "已形成基线", self.colors["primary"]),
-                ("待审批变更", self.db.one("SELECT COUNT(*) c FROM change_requests WHERE approval_status='pending'")["c"], "冻结版本变更入口", self.colors["danger"]),
+                ("变更待办", f"{change_summary['pending_count'] or 0} / {change_summary['approved_count'] or 0}", "待审批 / 待执行", self.colors["danger"]),
             ]
             rows = self.db.query("""SELECT requirement_code, requirement_name, source_role, priority, status, owner_name, updated_at
                                     FROM requirements
@@ -3809,7 +4310,7 @@ class App(tk.Tk):
             return
         requirement_options = self.requirement_options(include_unplanned=False)
         d = FieldDialog(self, "登记资金流水", [
-            ("flow_type", "资金类型", "combo", ["计划预算", "已分配预算", "实际消耗", "调整金额", "冻结金额"]),
+            ("flow_type", "资金类型", "combo", list(BUDGET_FLOW_TYPES)),
             ("requirement_option", "关联需求", "combo", requirement_options),
             ("amount", "金额", "text", None), ("description", "说明", "memo", None),
         ], required=["amount"])
@@ -3847,6 +4348,7 @@ class App(tk.Tk):
         bar = self.make_action_bar(self.content)
         if self.can_action("funding_create"):
             ttk.Button(bar, text="新建申报", command=self.add_funding_application, style="Primary.TButton").pack(side=tk.LEFT)
+            ttk.Button(bar, text="编辑申报", command=self.edit_funding_application).pack(side=tk.LEFT, padx=(8, 0))
         if self.can_action("funding_submit") or self.can_action("funding_review"):
             ttk.Button(bar, text="推进状态", command=self.advance_funding_application).pack(side=tk.LEFT, padx=(8, 0))
         if self.can_action("export"):
@@ -3897,9 +4399,9 @@ class App(tk.Tk):
         if not d.result:
             return
         try:
-            amount = self.parse_float(d.result["amount"], "申报金额")
+            amount = round(self.parse_float(d.result["amount"], "申报金额"), 2)
             if amount <= 0:
-                raise ValueError("申报金额必须大于 0。")
+                raise ValueError("申报金额按两位小数计价后必须大于 0。")
             t = now_text()
             code = "FUND-" + datetime.now().strftime("%Y%m%d%H%M%S%f")
             cur = self.db.execute("""INSERT INTO funding_applications(
@@ -3923,15 +4425,48 @@ class App(tk.Tk):
         except (TypeError, ValueError):
             return None
 
+    def edit_funding_application(self):
+        if not self.require_action("funding_create", "编辑资金申报"):
+            return
+        application_id = self.selected_funding_application_id()
+        if not application_id:
+            return
+        row = self.db.one("SELECT * FROM funding_applications WHERE id=?", (application_id,))
+        if not row:
+            messagebox.showerror("资金申报", "资金申报不存在。")
+            return
+        if row["applicant_name"] != self.current_user:
+            messagebox.showwarning("不可编辑", "只有申请人可以编辑资金申报。")
+            return
+        if row["status"] not in {"草稿", "已驳回"}:
+            messagebox.showwarning("不可编辑", "只能编辑草稿或已驳回的资金申报。")
+            return
+        d = FieldDialog(self, "编辑资金申报", [
+            ("amount", "申报金额", "text", None), ("description", "申报说明", "memo", None),
+        ], {"amount": row["amount"], "description": row["description"] or ""},
+           required=["amount", "description"])
+        if not d.result:
+            return
+        try:
+            changed = self.db.update_funding_application(
+                application_id, self.parse_float(d.result["amount"], "申报金额"),
+                d.result["description"], self.current_user, now_text(),
+            )
+            if not changed:
+                messagebox.showwarning("状态冲突", "申报状态已被其他操作更新，请刷新后重试。")
+            self.show_funding_applications()
+        except (ValueError, sqlite3.DatabaseError) as exc:
+            messagebox.showerror("保存失败", str(exc))
+
     def advance_funding_application(self):
         application_id = self.selected_funding_application_id()
         if not application_id:
             return
         row = self.db.one("SELECT * FROM funding_applications WHERE id=?", (application_id,))
         targets = []
-        if row["status"] == "草稿" and self.can_action("funding_submit"):
+        if row["status"] in {"草稿", "已驳回"} and self.can_action("funding_submit"):
             targets = ["已提交"]
-        elif row["status"] != "草稿" and self.can_action("funding_review"):
+        elif row["status"] not in {"草稿", "已驳回"} and self.can_action("funding_review"):
             targets = FUNDING_TRANSITIONS.get(row["status"], [])
         if not targets:
             messagebox.showinfo("资金申报", "当前状态没有可执行的后续操作，或当前角色无权处理。")
@@ -4094,10 +4629,11 @@ class App(tk.Tk):
             if req_ids:
                 where.append(f"(related_object_type='需求' AND related_object_id IN ({','.join(['?'] * len(req_ids))}))")
                 params.extend(req_ids)
-        visibility = " AND visibility='客户可见'" if self.current_role.get() == "客户" else ""
+        visibility = "approval_status='approved' AND visibility='客户可见'" if self.current_role.get() == "客户" else "1=1"
         sql = """SELECT artifact_code, artifact_name, artifact_type, related_object_type, related_object_id,
-                        version_no, file_path, visibility, approval_status, uploaded_by, uploaded_at
-                 FROM artifacts WHERE approval_status='approved'""" + visibility + " AND (" + " OR ".join(where) + ") ORDER BY id DESC"
+                        version_no, file_path, visibility, approval_status, reviewed_by, reviewed_at,
+                        review_note, change_request_id, uploaded_by, uploaded_at
+                 FROM artifacts WHERE """ + visibility + " AND (" + " OR ".join(where) + ") ORDER BY id DESC"
         return self.db.query(sql, tuple(params))
 
     def show_artifacts(self):
@@ -4105,6 +4641,12 @@ class App(tk.Tk):
         bar = self.make_action_bar(self.content)
         if self.can_action("artifact"):
             ttk.Button(bar, text="挂载本地文件", command=self.add_artifact, style="Primary.TButton").pack(side=tk.LEFT)
+            ttk.Button(bar, text="提交审批", command=self.submit_selected_artifact).pack(side=tk.LEFT, padx=(8, 0))
+        if self.can_action("artifact_review"):
+            ttk.Button(bar, text="审批通过", command=self.approve_selected_artifact).pack(side=tk.LEFT, padx=(8, 0))
+            ttk.Button(bar, text="审批驳回", command=self.reject_selected_artifact).pack(side=tk.LEFT, padx=(8, 0))
+        if self.can_action("artifact_delete"):
+            ttk.Button(bar, text="删除/取消", command=self.delete_selected_artifact).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(bar, text="打开附件", command=self.open_selected_artifact).pack(side=tk.LEFT, padx=(8, 0))
         raw_rows = self.artifact_rows_for_context(
             self.current_project_id(), self.current_plan_id(), self.current_version_id(),
@@ -4113,8 +4655,24 @@ class App(tk.Tk):
         for r in raw_rows:
             item = dict(r)
             item["stage"] = ARTIFACT_STAGE_HINTS.get(item["artifact_type"], "其他")
+            item["approval_status_label"] = ARTIFACT_APPROVAL_LABELS.get(item["approval_status"], item["approval_status"])
+            if item["approval_status"] == "pending" and item.get("change_request_id"):
+                change = self.db.one(
+                    "SELECT approval_status FROM change_requests WHERE id=?", (item["change_request_id"],)
+                )
+                if change and change["approval_status"] == "approved":
+                    item["approval_status_label"] = "变更已批准，待执行"
             rows.append(item)
-        self.artifact_tree = self.add_table(self.content, [("artifact_code", "成果物编号", 130), ("artifact_name", "名称", 180), ("stage", "业务阶段", 110), ("artifact_type", "类型", 110), ("related_object_type", "挂载对象", 90), ("related_object_id", "对象ID", 70), ("version_no", "文件版本", 90), ("visibility", "可见范围", 90), ("file_path", "文件路径", 320), ("uploaded_by", "上传人", 90), ("uploaded_at", "上传时间", 150)], rows, on_double_click=self.open_selected_artifact)
+        columns = [("artifact_code", "成果物编号", 130), ("artifact_name", "名称", 180),
+                   ("stage", "业务阶段", 110), ("artifact_type", "类型", 110),
+                   ("approval_status_label", "审批状态", 100), ("related_object_type", "挂载对象", 90),
+                   ("related_object_id", "对象ID", 70), ("version_no", "文件版本", 90),
+                   ("visibility", "可见范围", 90), ("file_path", "文件路径", 260),
+                   ("uploaded_by", "上传人", 90), ("uploaded_at", "上传时间", 150)]
+        if self.current_role.get() != "客户":
+            columns += [("reviewed_by", "审批人", 90), ("reviewed_at", "审批时间", 150),
+                        ("review_note", "审批意见", 220)]
+        self.artifact_tree = self.add_table(self.content, columns, rows, on_double_click=self.open_selected_artifact)
 
     def selected_artifact(self):
         selection = getattr(self, "artifact_tree", None).selection() if hasattr(self, "artifact_tree") else ()
@@ -4122,7 +4680,72 @@ class App(tk.Tk):
             messagebox.showwarning("提示", "请先选择一个成果物。")
             return None
         artifact_code = self.artifact_tree.item(selection[0])["values"][0]
-        return self.db.one("SELECT id, artifact_code, artifact_name, file_path FROM artifacts WHERE artifact_code=?", (artifact_code,))
+        return self.db.one("SELECT * FROM artifacts WHERE artifact_code=?", (artifact_code,))
+
+    def submit_selected_artifact(self):
+        if not self.require_action("artifact", "提交成果物审批"):
+            return
+        artifact = self.selected_artifact()
+        if not artifact:
+            return
+        try:
+            result = self.db.submit_artifact_for_review(
+                artifact["id"], self.current_user, now_text(),
+                can_manage=self.can_action("artifact_review"),
+            )
+            if not result:
+                messagebox.showwarning("状态冲突", "成果物状态已被其他操作更新，请刷新后重试。")
+            elif result["approval_status"] == "pending":
+                messagebox.showinfo("已提交变更", f"冻结范围内成果物已进入变更申请 #{result['change_id']}。")
+            else:
+                messagebox.showinfo("已提交", "成果物已提交审批。")
+            self.show_artifacts()
+        except (ValueError, sqlite3.DatabaseError) as exc:
+            messagebox.showerror("提交失败", str(exc))
+
+    def approve_selected_artifact(self):
+        self.decide_selected_artifact(True)
+
+    def reject_selected_artifact(self):
+        self.decide_selected_artifact(False)
+
+    def decide_selected_artifact(self, approved):
+        if not self.require_action("artifact_review", "审批成果物"):
+            return
+        artifact = self.selected_artifact()
+        if not artifact:
+            return
+        d = FieldDialog(self, "成果物审批", [("review_note", "审批意见", "memo", None)])
+        if not d.result:
+            return
+        try:
+            changed = self.db.review_artifact(
+                artifact["id"], approved, d.result["review_note"], self.current_user,
+                now_text(), can_review=True,
+            )
+            if not changed:
+                messagebox.showwarning("状态冲突", "成果物状态已被其他操作更新，请刷新后重试。")
+            self.show_artifacts()
+        except (ValueError, sqlite3.DatabaseError) as exc:
+            messagebox.showerror("审批失败", str(exc))
+
+    def delete_selected_artifact(self):
+        if not self.require_action("artifact_delete", "删除或取消成果物"):
+            return
+        artifact = self.selected_artifact()
+        if not artifact:
+            return
+        if not messagebox.askyesno("确认删除", f"确认删除或取消成果物“{artifact['artifact_name']}”？"):
+            return
+        try:
+            result = self.db.delete_artifact_record(
+                artifact["id"], self.current_user, now_text(), can_manage=True,
+            )
+            if not result["attachment_deleted"]:
+                messagebox.showinfo("记录已处理", "成果物记录已处理；附件不存在或不在受管附件目录内，未执行文件删除。")
+            self.show_artifacts()
+        except (ValueError, sqlite3.DatabaseError) as exc:
+            messagebox.showerror("删除失败", str(exc))
 
     def open_selected_artifact(self, _event=None):
         artifact = self.selected_artifact()
@@ -4216,6 +4839,8 @@ class App(tk.Tk):
                 }, self.current_user, t)
                 if result["approval_status"] == "pending":
                     messagebox.showinfo("已提交审批", f"冻结范围内新增成果物已进入变更申请 #{result['change_id']}，审批通过后可见。")
+                else:
+                    messagebox.showinfo("草稿已保存", "成果物已保存为草稿，请提交审批后生效。")
                 self.show_artifacts()
             except (OSError, ValueError, sqlite3.DatabaseError) as exc:
                 log_transaction_exception("add_artifact", exc)
@@ -4542,28 +5167,68 @@ class App(tk.Tk):
             ttk.Button(tag_bar, text="启用/停用", command=self.toggle_tag_definition).pack(side=tk.LEFT, padx=(8, 0))
             tags = self.db.query("SELECT id, tag_name, is_active, created_at FROM tag_definitions ORDER BY tag_name")
             self.tag_tree = self.add_table(self.content, [("id", "ID", 50), ("tag_name", "标签名称", 220), ("is_active", "启用", 70), ("created_at", "创建时间", 150)], tags, 5)
-        self.section_title(self.content, "变更申请", "冻结版本内的需求修改、删除及新增成果物会进入此列表，由管理员或咨询负责人审批。")
+        self.section_title(
+            self.content,
+            "变更申请",
+            "冻结版本变更先由申请人以外的实际复核人批准，再单独执行并生成新基线；批准本身不会修改业务数据。",
+        )
         bar = self.make_action_bar(self.content)
         ttk.Label(bar, text="状态").pack(side=tk.LEFT)
-        status_box = ttk.Combobox(bar, textvariable=self.change_status_filter, values=["全部", "pending", "approved", "rejected"], state="readonly", width=12)
+        status_box = ttk.Combobox(
+            bar,
+            textvariable=self.change_status_filter,
+            values=["全部"] + list(CHANGE_STATUS_LABELS.values()),
+            state="readonly",
+            width=16,
+        )
         status_box.pack(side=tk.LEFT, padx=(6, 10))
         status_box.bind("<<ComboboxSelected>>", lambda e: self.show_settings())
         ttk.Button(bar, text="查看变更详情", command=self.show_change_request_detail).pack(side=tk.LEFT)
-        ttk.Button(bar, text="通过", command=self.approve_change_request).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bar, text="批准", command=self.approve_change_request).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(bar, text="驳回", command=self.reject_change_request).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bar, text="执行变更", command=self.execute_change_request, style="Primary.TButton").pack(side=tk.LEFT, padx=(8, 0))
         where = ""
         params = ()
         if self.change_status_filter.get() != "全部":
             where = "WHERE c.approval_status=?"
-            params = (self.change_status_filter.get(),)
-        changes = self.db.query(f"""SELECT c.id, c.approval_status, v.version_code, r.requirement_code, c.change_title,
-                                           c.requested_by, c.requested_at, c.approved_by, c.approved_at
-                                    FROM change_requests c
-                                    LEFT JOIN implementation_versions v ON c.version_id=v.id
-                                    LEFT JOIN requirements r ON c.requirement_id=r.id
-                                    {where}
-                                    ORDER BY c.id DESC LIMIT 80""", params)
-        self.change_tree = self.add_table(self.content, [("id", "ID", 50), ("approval_status", "状态", 90), ("version_code", "版本", 90), ("requirement_code", "需求编号", 130), ("change_title", "标题", 260), ("requested_by", "申请人", 90), ("requested_at", "申请时间", 150), ("approved_by", "审批人", 90), ("approved_at", "审批时间", 150)], changes, 8)
+            status_value = next(
+                (key for key, label in CHANGE_STATUS_LABELS.items() if label == self.change_status_filter.get()),
+                self.change_status_filter.get(),
+            )
+            params = (status_value,)
+        raw_changes = self.db.query(f"""SELECT c.id, c.approval_status, c.expected_baseline_sequence,
+                                               COALESCE((SELECT MAX(b.snapshot_no) FROM version_baselines b
+                                                         WHERE b.version_id=c.version_id), 0) current_baseline_sequence,
+                                               v.version_code, r.requirement_code, c.change_title,
+                                               c.requested_by, c.requested_at, c.approved_by, c.approved_at,
+                                               c.applied_by, c.applied_at, rb.snapshot_no applied_baseline_sequence
+                                        FROM change_requests c
+                                        LEFT JOIN implementation_versions v ON c.version_id=v.id
+                                        LEFT JOIN requirements r ON c.requirement_id=r.id
+                                        LEFT JOIN version_baselines rb ON rb.id=c.applied_baseline_id
+                                        {where}
+                                        ORDER BY c.id DESC LIMIT 80""", params)
+        changes = []
+        for row in raw_changes:
+            item = dict(row)
+            item["approval_status_label"] = CHANGE_STATUS_LABELS.get(
+                item["approval_status"], item["approval_status"]
+            )
+            if (item["approval_status"] == "approved" and
+                    item["expected_baseline_sequence"] != item["current_baseline_sequence"]):
+                item["approval_status_label"] += "（基线已过期）"
+            item["baseline_context"] = (
+                f"基于 #{item['expected_baseline_sequence']} / 当前 #{item['current_baseline_sequence']}"
+            )
+            changes.append(item)
+        self.change_tree = self.add_table(self.content, [
+            ("id", "ID", 50), ("approval_status_label", "状态", 150), ("version_code", "版本", 90),
+            ("baseline_context", "基线", 170), ("requirement_code", "需求编号", 130),
+            ("change_title", "标题", 240), ("requested_by", "申请人", 100),
+            ("requested_at", "申请时间", 150), ("approved_by", "审批人", 100),
+            ("approved_at", "审批时间", 150), ("applied_by", "执行人", 100),
+            ("applied_at", "执行时间", 150), ("applied_baseline_sequence", "结果基线", 90),
+        ], changes, 8)
         self.section_title(self.content, "操作日志", "记录关键数据修改、状态流转、版本冻结、成果物上传和备份等动作。")
         audit_bar = self.make_action_bar(self.content)
         ttk.Label(audit_bar, text="对象类型").pack(side=tk.LEFT)
@@ -4648,19 +5313,33 @@ class App(tk.Tk):
         change_id = self.selected_change_id()
         if not change_id:
             return
-        change = self.db.one("""SELECT c.*, v.version_code, r.requirement_code, r.requirement_name
+        change = self.db.one("""SELECT c.*, v.version_code, r.requirement_code, r.requirement_name,
+                                       COALESCE((SELECT MAX(b.snapshot_no) FROM version_baselines b
+                                                 WHERE b.version_id=c.version_id), 0) current_baseline_sequence,
+                                       rb.snapshot_no applied_baseline_sequence
                                 FROM change_requests c
                                 LEFT JOIN implementation_versions v ON v.id=c.version_id
-                                LEFT JOIN requirements r ON r.id=c.requirement_id WHERE c.id=?""", (change_id,))
+                                LEFT JOIN requirements r ON r.id=c.requirement_id
+                                LEFT JOIN version_baselines rb ON rb.id=c.applied_baseline_id
+                                WHERE c.id=?""", (change_id,))
         payload = self.db.one("SELECT change_type FROM change_request_payloads WHERE change_request_id=?", (change_id,))
+        status_label = CHANGE_STATUS_LABELS.get(change["approval_status"], change["approval_status"])
+        if (change["approval_status"] == "approved" and
+                change["expected_baseline_sequence"] != change["current_baseline_sequence"]):
+            status_label += "（基线已过期，需重新提交）"
         DetailDialog(self, f"变更申请 #{change_id}", [
-            ("申请信息", [("状态", change["approval_status"]), ("版本", change["version_code"]),
+            ("申请信息", [("状态", status_label), ("版本", change["version_code"]),
+                         ("基于基线", f"#{change['expected_baseline_sequence']}"),
+                         ("当前基线", f"#{change['current_baseline_sequence']}"),
                          ("需求", f"{change['requirement_code'] or '-'} {change['requirement_name'] or ''}"),
                          ("标题", change["change_title"]), ("申请人", change["requested_by"]), ("申请时间", change["requested_at"])]),
             ("原因与影响", [("变更原因", change["change_reason"]), ("影响范围", change["impact_scope"])]),
             ("拟变更摘要", [("变更类型", payload["change_type"] if payload else "缺失"),
                             ("摘要", self.change_payload_summary(change_id))]),
-            ("审批信息", [("审批人", change["approved_by"]), ("审批时间", change["approved_at"])]),
+            ("审批信息", [("审批人", change["approved_by"]), ("审批时间", change["approved_at"]),
+                          ("审批意见", change["decision_note"])]),
+            ("执行信息", [("执行人", change["applied_by"]), ("执行时间", change["applied_at"]),
+                          ("结果基线", f"#{change['applied_baseline_sequence']}" if change["applied_baseline_sequence"] else "")]),
         ])
 
     def update_change_request(self, status):
@@ -4673,17 +5352,72 @@ class App(tk.Tk):
         if change["approval_status"] != "pending":
             messagebox.showinfo("提示", "该变更申请已处理")
             return
-        action = "通过" if status == "approved" else "驳回"
+        action = "批准" if status == "approved" else "驳回"
         summary = self.change_payload_summary(change_id)
+        d = FieldDialog(self, f"{action}变更申请", [
+            ("requester_name", "申请人", "readonly", None),
+            ("reviewer_name", "实际审批人", "text", None),
+            ("decision_note", "审批意见", "memo", None),
+        ], {"requester_name": change["requested_by"] or "", "reviewer_name": ""},
+           required=["reviewer_name", "decision_note"])
+        if not d.result:
+            return
+        reviewer_name = d.result["reviewer_name"]
+        if reviewer_name.casefold() == str(change["requested_by"] or "").strip().casefold():
+            messagebox.showerror("不能自审", "变更申请人不能审批自己的申请，请录入另一名实际复核人。")
+            return
         confirm_text = (f"确认{action}该变更申请？\n\n变更原因：{change['change_reason'] or '未填写'}\n"
-                        f"影响范围：{change['impact_scope'] or '未填写'}\n拟变更：{summary}")
+                        f"影响范围：{change['impact_scope'] or '未填写'}\n拟变更：{summary}\n\n"
+                        + ("批准后业务数据不会立即变化，仍需单独执行。" if status == "approved" else "驳回后该申请不能执行。"))
         if not messagebox.askyesno("确认审批", confirm_text):
             return
         try:
-            self.db.review_change_request(change_id, status, self.current_user, now_text())
+            self.db.review_change_request(
+                change_id, status, reviewer_name, now_text(), d.result["decision_note"]
+            )
+            messagebox.showinfo(
+                "审批完成",
+                "变更申请已批准，业务尚未生效，请选择该申请并执行变更。"
+                if status == "approved" else "变更申请已驳回。",
+            )
             self.show_settings()
         except Exception as exc:
             messagebox.showerror("审批失败", str(exc))
+
+    def execute_change_request(self):
+        if not self.require_action("approve", "执行已批准变更"):
+            return
+        change_id = self.selected_change_id()
+        if not change_id:
+            return
+        change = self.db.one("SELECT * FROM change_requests WHERE id=?", (change_id,))
+        if change["approval_status"] != "approved":
+            messagebox.showinfo("不能执行", "只有“已批准，待执行”的变更申请可以执行。")
+            return
+        d = FieldDialog(self, "执行已批准变更", [
+            ("reviewer_name", "审批人", "readonly", None),
+            ("executor_name", "执行人", "text", None),
+        ], {"reviewer_name": change["approved_by"] or "", "executor_name": self.current_user},
+           required=["executor_name"])
+        if not d.result:
+            return
+        summary = self.change_payload_summary(change_id)
+        if not messagebox.askyesno(
+            "确认执行变更",
+            f"执行后将正式修改业务数据并生成递增的新版本基线。\n\n拟变更：{summary}\n\n确认继续？",
+        ):
+            return
+        try:
+            baseline = self.db.apply_change_request(
+                change_id, d.result["executor_name"], now_text()
+            )
+            messagebox.showinfo(
+                "执行完成",
+                f"变更已生效，并生成版本基线 #{baseline['snapshot_no']}。",
+            )
+            self.show_settings()
+        except Exception as exc:
+            messagebox.showerror("执行失败", str(exc))
 
 
 if __name__ == "__main__":

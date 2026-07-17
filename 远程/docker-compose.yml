@@ -1,0 +1,121 @@
+name: consulting-requirement-manager
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:?Set MYSQL_DATABASE in .env}
+      MYSQL_USER: ${MYSQL_USER:?Set MYSQL_USER in .env}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+08:00
+    volumes:
+      - mysql_data:/var/lib/mysql
+    expose:
+      - "3306"
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_ROOT_PASSWORD\" mysqladmin ping -h 127.0.0.1 -uroot --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - database
+
+  api:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    logging: *default-logging
+    init: true
+    read_only: true
+    environment:
+      APP_ENV: production
+      DATABASE_URL: mysql+pymysql://${MYSQL_USER:?Set MYSQL_USER in .env}:${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}@mysql:3306/${MYSQL_DATABASE:?Set MYSQL_DATABASE in .env}?charset=utf8mb4
+      COOKIE_SECURE: "true"
+      SESSION_HOURS: ${SESSION_HOURS:-12}
+      MAX_LOGIN_FAILURES: ${MAX_LOGIN_FAILURES:-5}
+      LOCK_MINUTES: ${LOCK_MINUTES:-15}
+      UPLOAD_DIR: /data/uploads
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-50}
+      AUTO_CREATE_TABLES: "false"
+      AUTO_SEED: "false"
+      ADMIN_USERNAME: ${ADMIN_USERNAME:?Set ADMIN_USERNAME in .env}
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD?Define ADMIN_PASSWORD in .env; it may be empty only after bootstrap}"
+      CORS_ORIGINS: ""
+    volumes:
+      - upload_data:/data/uploads
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    expose:
+      - "8000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - database
+      - proxy
+
+  web:
+    build:
+      context: ./web
+    restart: unless-stopped
+    logging: *default-logging
+    init: true
+    read_only: true
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - edge
+      - proxy
+
+networks:
+  edge:
+    driver: bridge
+  proxy:
+    driver: bridge
+    internal: true
+  database:
+    driver: bridge
+    internal: true
+
+volumes:
+  mysql_data:
+  upload_data:
+  caddy_data:
+  caddy_config:

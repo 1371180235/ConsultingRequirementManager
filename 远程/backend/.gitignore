@@ -1,0 +1,8 @@
+.env
+.pytest_cache/
+**/__pycache__/
+*.py[cod]
+consulting_remote.db
+tests/*.db
+tests/uploads/
+data/

@@ -55,6 +55,14 @@ class LocalInstallerTest(unittest.TestCase):
             "ConsultingRequirementManagerSetup.spec"
         ).read_text(encoding="utf-8")
         self.assertIn(installer.LICENSE_FILENAME, setup_spec)
+        application_spec = Path(installer.__file__).with_name(
+            "ConsultingRequirementManager.spec"
+        ).read_text(encoding="utf-8")
+        self.assertIn("datas=[]", application_spec)
+        for forbidden_artifact in ("app.db", "runtime.log", "error.log", "audit.log"):
+            with self.subTest(forbidden_artifact=forbidden_artifact):
+                self.assertNotIn(forbidden_artifact, application_spec)
+                self.assertNotIn(forbidden_artifact, setup_spec)
 
     def test_rejected_license_does_not_touch_install_target(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -66,6 +74,19 @@ class LocalInstallerTest(unittest.TestCase):
                 installer.install_application(target, bundle, license_accepted=False)
 
             self.assertFalse(target.exists())
+
+    def test_fresh_install_creates_empty_data_directories(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _bundle, target = self.install_fixture(root)
+            data_dir = target / "data"
+
+            self.assertTrue(data_dir.is_dir())
+            self.assertFalse((data_dir / "app.db").exists())
+            self.assertEqual(
+                [path.relative_to(data_dir) for path in data_dir.rglob("*") if path.is_file()],
+                [],
+            )
 
     def test_install_and_upgrade_preserve_existing_data(self):
         with tempfile.TemporaryDirectory() as temp_dir:
